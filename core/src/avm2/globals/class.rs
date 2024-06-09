@@ -6,9 +6,7 @@ use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
-use crate::avm2::Multiname;
 use crate::avm2::QName;
-use gc_arena::GcCell;
 
 /// Implements `Class`'s instance initializer.
 ///
@@ -44,23 +42,24 @@ fn prototype<'gc>(
 }
 
 /// Construct `Class`'s class.
-pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_class<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    object_class: Class<'gc>,
+) -> Class<'gc> {
     let gc_context = activation.context.gc_context;
     let class_class = Class::new(
-        QName::new(activation.avm2().public_namespace, "Class"),
-        Some(Multiname::new(activation.avm2().public_namespace, "Object")),
+        QName::new(activation.avm2().public_namespace_base_version, "Class"),
+        Some(object_class),
         Method::from_builtin(instance_init, "<Class instance initializer>", gc_context),
         Method::from_builtin(class_init, "<Class class initializer>", gc_context),
         gc_context,
     );
 
-    let mut write = class_class.write(gc_context);
-
     // 'length' is a weird undocumented constant in Class.
     // We need to define it, since it shows up in 'describeType'
     const CLASS_CONSTANTS: &[(&str, i32)] = &[("length", 1)];
-    write.define_constant_int_class_traits(
-        activation.avm2().public_namespace,
+    class_class.define_constant_int_class_traits(
+        activation.avm2().public_namespace_base_version,
         CLASS_CONSTANTS,
         activation,
     );
@@ -70,11 +69,16 @@ pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Cl
         Option<NativeMethodImpl>,
         Option<NativeMethodImpl>,
     )] = &[("prototype", Some(prototype), None)];
-    write.define_builtin_instance_properties(
+    class_class.define_builtin_instance_properties(
         gc_context,
-        activation.avm2().public_namespace,
+        activation.avm2().public_namespace_base_version,
         PUBLIC_INSTANCE_PROPERTIES,
     );
+
+    class_class.mark_traits_loaded(activation.context.gc_context);
+    class_class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
 
     class_class
 }

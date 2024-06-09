@@ -116,6 +116,10 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         read.base.get_property_local(name, activation)
     }
 
+    fn get_index_property(self, index: usize) -> Option<Value<'gc>> {
+        self.0.read().vector.get_optional(index)
+    }
+
     fn set_property_local(
         self,
         name: &Multiname<'gc>,
@@ -244,10 +248,6 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         } else {
             Ok(Value::Undefined)
         }
-    }
-
-    fn to_string(&self, _activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(Value::Object(Object::from(*self)))
     }
 
     fn value_of(&self, _mc: &Mutation<'gc>) -> Result<Value<'gc>, Error<'gc>> {

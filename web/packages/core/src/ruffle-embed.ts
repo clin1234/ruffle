@@ -1,12 +1,10 @@
 import {
-    isBuiltInContextMenuVisible,
+    getPolyfillOptions,
     isFallbackElement,
-    isScriptAccessAllowed,
     isYoutubeFlashSource,
     RufflePlayer,
     workaroundYoutubeMixedContent,
 } from "./ruffle-player";
-import { NetworkingAccessMode, WindowMode } from "./load-options";
 import { registerElement } from "./register-element";
 import { isSwf } from "./swf-utils";
 
@@ -37,42 +35,28 @@ export class RuffleEmbed extends RufflePlayer {
         super.connectedCallback();
         const src = this.attributes.getNamedItem("src");
         if (src) {
-            const allowScriptAccess =
-                this.attributes.getNamedItem("allowScriptAccess")?.value ??
-                null;
-            const menu = this.attributes.getNamedItem("menu")?.value ?? null;
+            // Get the configuration options that have been overwritten for this movie.
+            const getOptionString = (optionName: string) =>
+                this.attributes.getNamedItem(optionName)?.value ?? null;
+            const options = getPolyfillOptions(src.value, getOptionString);
 
             // Kick off the SWF download.
-            this.load({
-                url: src.value,
-                allowScriptAccess: isScriptAccessAllowed(
-                    allowScriptAccess,
-                    src.value,
-                ),
-                parameters:
-                    this.attributes.getNamedItem("flashvars")?.value ?? null,
-                backgroundColor:
-                    this.attributes.getNamedItem("bgcolor")?.value ?? null,
-                base: this.attributes.getNamedItem("base")?.value ?? null,
-                menu: isBuiltInContextMenuVisible(menu),
-                salign: this.attributes.getNamedItem("salign")?.value ?? "",
-                quality:
-                    this.attributes.getNamedItem("quality")?.value ?? "high",
-                scale:
-                    this.attributes.getNamedItem("scale")?.value ?? "showAll",
-                wmode:
-                    (this.attributes.getNamedItem("wmode")
-                        ?.value as WindowMode) ?? WindowMode.Window,
-                allowNetworking:
-                    (this.attributes.getNamedItem("allowNetworking")
-                        ?.value as NetworkingAccessMode) ??
-                    NetworkingAccessMode.All,
-            });
+            this.load(options, true);
         }
     }
 
     /**
-     * Polyfill of HTMLObjectElement.
+     * Polyfill of HTMLEmbedElement.
+     *
+     * @ignore
+     * @internal
+     */
+    override get nodeName(): string {
+        return "EMBED";
+    }
+
+    /**
+     * Polyfill of HTMLEmbedElement.
      *
      * @ignore
      * @internal
@@ -82,7 +66,7 @@ export class RuffleEmbed extends RufflePlayer {
     }
 
     /**
-     * Polyfill of HTMLObjectElement.
+     * Polyfill of HTMLEmbedElement.
      *
      * @ignore
      * @internal
@@ -118,13 +102,10 @@ export class RuffleEmbed extends RufflePlayer {
         if (this.isConnected && name === "src") {
             const src = this.attributes.getNamedItem("src");
             if (src) {
-                this.load({
-                    url: src.value,
-                    parameters:
-                        this.attributes.getNamedItem("flashvars")?.value ??
-                        null,
-                    base: this.attributes.getNamedItem("base")?.value ?? null,
-                });
+                const getOptionString = (optionName: string) =>
+                    this.attributes.getNamedItem(optionName)?.value ?? null;
+                const options = getPolyfillOptions(src.value, getOptionString);
+                this.load(options, true);
             }
         }
     }

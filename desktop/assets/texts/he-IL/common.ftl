@@ -1,2 +1,6 @@
+language-name = עברית (ישראל)
 start = התחל
-browse = סייר
+browse = עיון
+save = שמור
+cancel = ביטול
+remove = הסר

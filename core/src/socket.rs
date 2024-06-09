@@ -11,16 +11,17 @@ use crate::{
     context::UpdateContext,
     string::AvmString,
 };
-use async_channel::{unbounded, Sender as AsyncSender};
+use async_channel::{unbounded, Receiver, Sender as AsyncSender, Sender};
 use gc_arena::Collect;
-use generational_arena::{Arena, Index};
+use slotmap::{new_key_type, SlotMap};
 use std::{
-    cell::RefCell,
-    sync::mpsc::{channel, Receiver, Sender},
+    cell::{Cell, RefCell},
     time::Duration,
 };
 
-pub type SocketHandle = Index;
+new_key_type! {
+    pub struct SocketHandle;
+}
 
 #[derive(Copy, Clone, Collect)]
 #[collect(no_drop)]
@@ -34,6 +35,7 @@ enum SocketKind<'gc> {
 struct Socket<'gc> {
     target: SocketKind<'gc>,
     sender: RefCell<AsyncSender<Vec<u8>>>,
+    connected: Cell<bool>,
 }
 
 impl<'gc> Socket<'gc> {
@@ -41,18 +43,19 @@ impl<'gc> Socket<'gc> {
         Self {
             target,
             sender: RefCell::new(sender),
+            connected: Cell::new(false),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionState {
     Connected,
     Failed,
     TimedOut,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SocketAction {
     Connect(SocketHandle, ConnectionState),
     Data(SocketHandle, Vec<u8>),
@@ -61,7 +64,7 @@ pub enum SocketAction {
 
 /// Manages the collection of Sockets.
 pub struct Sockets<'gc> {
-    sockets: Arena<Socket<'gc>>,
+    sockets: SlotMap<SocketHandle, Socket<'gc>>,
 
     receiver: Receiver<SocketAction>,
     sender: Sender<SocketAction>,
@@ -77,10 +80,10 @@ unsafe impl<'gc> Collect for Sockets<'gc> {
 
 impl<'gc> Sockets<'gc> {
     pub fn empty() -> Self {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = unbounded();
 
         Self {
-            sockets: Arena::new(),
+            sockets: SlotMap::with_key(),
             receiver,
             sender,
         }
@@ -150,31 +153,54 @@ impl<'gc> Sockets<'gc> {
     }
 
     pub fn is_connected(&self, handle: SocketHandle) -> bool {
-        matches!(self.sockets.get(handle), Some(Socket { .. }))
+        if let Some(socket) = self.sockets.get(handle) {
+            socket.connected.get()
+        } else {
+            false
+        }
     }
 
     pub fn send(&mut self, handle: SocketHandle, data: Vec<u8>) {
         if let Some(Socket { sender, .. }) = self.sockets.get_mut(handle) {
-            let _ = sender.borrow().send_blocking(data);
+            // We use an unbounded socket, so this should only ever error if the channel is closed
+            // (the receiver was dropped)
+            if let Err(e) = sender.borrow().try_send(data) {
+                tracing::error!("Failed to send data to socket: {:?}", e);
+            }
+        }
+    }
+
+    pub fn close_all(&mut self) {
+        for (_, socket) in self.sockets.drain() {
+            Self::close_internal(socket);
         }
     }
 
     pub fn close(&mut self, handle: SocketHandle) {
-        if let Some(Socket { sender, target }) = self.sockets.remove(handle) {
-            drop(sender); // NOTE: By dropping the sender, the reading task will close automatically.
+        if let Some(socket) = self.sockets.remove(handle) {
+            Self::close_internal(socket);
+        }
+    }
 
-            // Clear the buffers if the connection was closed.
-            match target {
-                SocketKind::Avm1(target) => {
-                    let target =
-                        XmlSocket::cast(target.into()).expect("target should be XmlSocket");
+    fn close_internal(socket: Socket) {
+        let Socket {
+            sender,
+            target,
+            connected: _,
+        } = socket;
 
-                    target.read_buffer().clear();
-                }
-                SocketKind::Avm2(target) => {
-                    target.read_buffer().clear();
-                    target.write_buffer().clear();
-                }
+        drop(sender); // NOTE: By dropping the sender, the reading task will close automatically.
+
+        // Clear the buffers if the connection was closed.
+        match target {
+            SocketKind::Avm1(target) => {
+                let target = XmlSocket::cast(target.into()).expect("target should be XmlSocket");
+
+                target.read_buffer().clear();
+            }
+            SocketKind::Avm2(target) => {
+                target.read_buffer().clear();
+                target.write_buffer().clear();
             }
         }
     }
@@ -190,7 +216,10 @@ impl<'gc> Sockets<'gc> {
             match action {
                 SocketAction::Connect(handle, ConnectionState::Connected) => {
                     let target = match context.sockets.sockets.get(handle) {
-                        Some(socket) => socket.target,
+                        Some(socket) => {
+                            socket.connected.set(true);
+                            socket.target
+                        }
                         // Socket must have been closed before we could send event.
                         None => continue,
                     };
@@ -373,7 +402,10 @@ impl<'gc> Sockets<'gc> {
                 }
                 SocketAction::Close(handle) => {
                     let target = match context.sockets.sockets.remove(handle) {
-                        Some(socket) => socket.target,
+                        Some(socket) => {
+                            socket.connected.set(false);
+                            socket.target
+                        }
                         // Socket must have been closed before we could send event.
                         None => continue,
                     };

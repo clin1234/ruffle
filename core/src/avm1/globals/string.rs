@@ -133,8 +133,11 @@ fn char_code_at<'gc>(
         .get(0)
         .unwrap_or(&Value::Undefined)
         .coerce_to_i32(activation)?;
+    let is_swf5 = activation.swf_version() == 5;
     let ret = if i >= 0 {
-        this.get(i as usize).map(f64::from).unwrap_or(f64::NAN)
+        this.get(i as usize)
+            .map(f64::from)
+            .unwrap_or(if is_swf5 { 0.into() } else { f64::NAN })
     } else {
         f64::NAN
     };
@@ -258,33 +261,45 @@ fn split<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = Value::from(this).coerce_to_string(activation)?;
-    let delimiter = args
-        .get(0)
-        .unwrap_or(&Value::Undefined)
-        .coerce_to_string(activation)?;
     let limit = match args.get(1).unwrap_or(&Value::Undefined) {
         Value::Undefined => usize::MAX,
         limit => limit.coerce_to_i32(activation)?.max(0) as usize,
     };
-    if delimiter.is_empty() {
-        // When using an empty delimiter, Str::split adds an extra beginning and trailing item, but Flash does not.
-        // e.g., split("foo", "") returns ["", "f", "o", "o", ""] in Rust but ["f, "o", "o"] in Flash.
-        // Special case this to match Flash's behavior.
-        Ok(ArrayObject::new(
-            activation.context.gc_context,
-            activation.context.avm1.prototypes().array,
-            this.iter().take(limit).map(|c| {
-                AvmString::new(activation.context.gc_context, WString::from_unit(c)).into()
-            }),
-        )
-        .into())
+    // Contrary to the docs, in SWFv5 the default delimiter is comma (,)
+    // and the empty string behaves the same as undefined does in later SWF versions.
+    let is_swf5 = activation.swf_version() == 5;
+    if let Some(delimiter) = match args.get(0).unwrap_or(&Value::Undefined) {
+        &Value::Undefined => is_swf5.then_some(",".into()),
+        v => Some(v.coerce_to_string(activation)?).filter(|s| !(is_swf5 && s.is_empty())),
+    } {
+        if delimiter.is_empty() {
+            // When using an empty delimiter, Str::split adds an extra beginning and trailing item,
+            // but Flash does not.
+            // e.g., split("foo", "") returns ["", "f", "o", "o", ""] in Rust but ["f, "o", "o"] in Flash.
+            // Special case this to match Flash's behavior.
+            Ok(ArrayObject::new(
+                activation.context.gc_context,
+                activation.context.avm1.prototypes().array,
+                this.iter().take(limit).map(|c| {
+                    AvmString::new(activation.context.gc_context, WString::from_unit(c)).into()
+                }),
+            )
+            .into())
+        } else {
+            Ok(ArrayObject::new(
+                activation.context.gc_context,
+                activation.context.avm1.prototypes().array,
+                this.split(&delimiter)
+                    .take(limit)
+                    .map(|c| AvmString::new(activation.context.gc_context, c).into()),
+            )
+            .into())
+        }
     } else {
         Ok(ArrayObject::new(
             activation.context.gc_context,
             activation.context.avm1.prototypes().array,
-            this.split(&delimiter)
-                .take(limit)
-                .map(|c| AvmString::new(activation.context.gc_context, c).into()),
+            [this.into()],
         )
         .into())
     }

@@ -7,26 +7,36 @@ import type {
     URLLoadOptions,
 } from "ruffle-core";
 
+declare global {
+    interface Navigator {
+        /**
+         * iPadOS sends a User-Agent string that appears to be from macOS.
+         * navigator.standalone is not defined on macOS, so we use it for iPad detection.
+         */
+        standalone?: boolean;
+    }
+}
+
 const api = PublicAPI.negotiate(window.RufflePlayer!, "local");
 window.RufflePlayer = api;
 const ruffle = api.newest()!;
 let player: RufflePlayer;
 
-const main = document.getElementById("main")!;
+const playerContainer = document.getElementById("player-container")!;
 const overlay = document.getElementById("overlay")!;
 const localFileInput = document.getElementById(
     "local-file",
 )! as HTMLInputElement;
 const localFileName = document.getElementById("local-file-name")!;
-const closeModal = document.getElementById("close-modal")!;
-const openModal = document.getElementById("open-modal")!;
+const toggleInfo = document.getElementById("toggle-info")!;
 const reloadSwf = document.getElementById("reload-swf")!;
-const metadataModal = document.getElementById("metadata-modal")!;
+const infoContainer = document.getElementById("info-container")!;
 const webFormSubmit = document.getElementById("web-form-submit")!;
 const webURL = document.getElementById("web-url")! as HTMLInputElement;
 
-// Default config used by the player.
-const defaultConfig = {
+// This is the base config always used by the extension player.
+// It has the highest priority and its options cannot be overwritten.
+const baseExtensionConfig = {
     letterbox: "on" as Letterbox,
     forceScale: true,
     forceAlign: true,
@@ -84,9 +94,8 @@ function unload() {
         document.querySelectorAll("span.metadata").forEach((el) => {
             el.textContent = "Loading";
         });
-        (
-            document.getElementById("backgroundColor")! as HTMLInputElement
-        ).value = "#FFFFFF";
+        document.getElementById("backgroundColor")!.style.backgroundColor =
+            "white";
     }
 }
 
@@ -94,8 +103,8 @@ function load(options: string | DataLoadOptions | URLLoadOptions) {
     unload();
     player = ruffle.createPlayer();
     player.id = "player";
-    main.append(player);
-    player.load(options);
+    playerContainer.append(player);
+    player.load(options, false);
     player.addEventListener("loadedmetadata", () => {
         if (player.metadata) {
             for (const [key, value] of Object.entries(player.metadata)) {
@@ -103,8 +112,8 @@ function load(options: string | DataLoadOptions | URLLoadOptions) {
                 if (metadataElement) {
                     switch (key) {
                         case "backgroundColor":
-                            (metadataElement as HTMLInputElement).value =
-                                value ?? "#FFFFFF";
+                            metadataElement.style.backgroundColor =
+                                value ?? "white";
                             break;
                         case "uncompressedLength":
                             metadataElement.textContent = `${value >> 10}Kb`;
@@ -133,7 +142,13 @@ async function loadFile(file: File | undefined) {
         localFileName.textContent = file.name;
     }
     const data = await new Response(file).arrayBuffer();
-    load({ data: data, swfFileName: file.name, ...defaultConfig });
+    const options = await utils.getExplicitOptions();
+    load({
+        ...options,
+        data: data,
+        swfFileName: file.name,
+        ...baseExtensionConfig,
+    });
     history.pushState("", document.title, window.location.pathname);
 }
 
@@ -148,21 +163,21 @@ localFileInput.addEventListener("change", (event) => {
     }
 });
 
-main.addEventListener("dragenter", (event) => {
+playerContainer.addEventListener("dragenter", (event) => {
     event.stopPropagation();
     event.preventDefault();
 });
-main.addEventListener("dragleave", (event) => {
+playerContainer.addEventListener("dragleave", (event) => {
     event.stopPropagation();
     event.preventDefault();
     overlay.classList.remove("drag");
 });
-main.addEventListener("dragover", (event) => {
+playerContainer.addEventListener("dragover", (event) => {
     event.stopPropagation();
     event.preventDefault();
     overlay.classList.add("drag");
 });
-main.addEventListener("drop", (event) => {
+playerContainer.addEventListener("drop", (event) => {
     event.stopPropagation();
     event.preventDefault();
     overlay.classList.remove("drag");
@@ -191,12 +206,12 @@ localFileInput.addEventListener("drop", (event) => {
     }
 });
 
-closeModal.addEventListener("click", () => {
-    metadataModal.style.display = "none";
-});
-
-openModal.addEventListener("click", () => {
-    metadataModal.style.display = "block";
+toggleInfo.addEventListener("click", () => {
+    if (infoContainer.style.display === "none") {
+        infoContainer.style.display = "flex";
+    } else {
+        infoContainer.style.display = "none";
+    }
 });
 
 reloadSwf.addEventListener("click", () => {
@@ -211,18 +226,14 @@ reloadSwf.addEventListener("click", () => {
 window.addEventListener("load", () => {
     if (
         navigator.userAgent.match(/iPad/i) ||
-        navigator.userAgent.match(/iPhone/i)
+        navigator.userAgent.match(/iPhone/i) ||
+        (navigator.platform === "MacIntel" &&
+            typeof navigator.standalone !== "undefined")
     ) {
         localFileInput.removeAttribute("accept");
     }
-    overlay.classList.remove("hidden");
+    overlay.removeAttribute("hidden");
 });
-
-window.onclick = (event) => {
-    if (event.target === metadataModal) {
-        metadataModal.style.display = "none";
-    }
-};
 
 async function loadSwf(swfUrl: string) {
     try {
@@ -239,7 +250,7 @@ async function loadSwf(swfUrl: string) {
         ...options,
         url: swfUrl,
         base: swfUrl.substring(0, swfUrl.lastIndexOf("/") + 1),
-        ...defaultConfig,
+        ...baseExtensionConfig,
     });
 }
 
@@ -258,6 +269,11 @@ window.addEventListener("pageshow", loadSwfFromHash);
 window.addEventListener("hashchange", loadSwfFromHash);
 
 window.addEventListener("DOMContentLoaded", () => {
+    document
+        .getElementById("local-file-label")!
+        .addEventListener("click", () => {
+            document.getElementById("local-file")!.click();
+        });
     webFormSubmit.addEventListener("click", () => {
         if (webURL.value !== "") {
             window.location.hash = webURL.value;

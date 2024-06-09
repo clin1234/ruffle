@@ -12,6 +12,9 @@ pub enum Error {
     #[error("Couldn't register bitmap: {0}")]
     InvalidBitmap(#[from] ruffle_render::error::Error),
 
+    #[error("Couldn't register font: {0}")]
+    InvalidFont(#[from] ttf_parser::FaceParsingError),
+
     #[error("Attempted to set symbol classes on movie without any")]
     NoSymbolClasses,
 
@@ -63,6 +66,10 @@ pub struct SwfMovie {
 
     /// The compressed length of the entire datastream
     compressed_len: usize,
+
+    /// Whether this SwfMovie actually represents a loaded movie or fills in for
+    /// something else, like an loaded image, filler movie, or error state.
+    is_movie: bool,
 }
 
 impl SwfMovie {
@@ -76,6 +83,7 @@ impl SwfMovie {
             parameters: Vec::new(),
             encoding: swf::UTF_8,
             compressed_len: 0,
+            is_movie: false,
         }
     }
 
@@ -83,15 +91,31 @@ impl SwfMovie {
     /// This is used by `Loader` when firing an initial `progress` event:
     /// `LoaderInfo.bytesTotal` is set to the actual value, but no data is available,
     /// and `LoaderInfo.parameters` is empty.
-    pub fn empty_fake_compressed_len(swf_version: u8, compressed_len: usize) -> Self {
+    pub fn fake_with_compressed_len(swf_version: u8, compressed_len: usize) -> Self {
         Self {
             header: HeaderExt::default_with_swf_version(swf_version),
-            data: vec![],
+            compressed_len,
+            data: Vec::new(),
             url: "file:///".into(),
             loader_url: None,
             parameters: Vec::new(),
             encoding: swf::UTF_8,
-            compressed_len,
+            is_movie: false,
+        }
+    }
+
+    /// Like `fake_with_compressed_len`, but uses actual data.
+    /// This is used when loading a Bitmap to expose the underlying content
+    pub fn fake_with_compressed_data(swf_version: u8, compressed_data: Vec<u8>) -> Self {
+        Self {
+            header: HeaderExt::default_with_swf_version(swf_version),
+            compressed_len: compressed_data.len(),
+            data: compressed_data,
+            url: "file:///".into(),
+            loader_url: None,
+            parameters: Vec::new(),
+            encoding: swf::UTF_8,
+            is_movie: false,
         }
     }
 
@@ -109,6 +133,7 @@ impl SwfMovie {
             parameters: Vec::new(),
             encoding: swf::UTF_8,
             compressed_len: 0,
+            is_movie: false,
         }
     }
 
@@ -143,6 +168,7 @@ impl SwfMovie {
             parameters: Vec::new(),
             encoding,
             compressed_len,
+            is_movie: true,
         };
         movie.append_parameters_from_url();
         Ok(movie)
@@ -158,6 +184,7 @@ impl SwfMovie {
             parameters: Vec::new(),
             encoding: swf::UTF_8,
             compressed_len: length,
+            is_movie: false,
         };
         movie.append_parameters_from_url();
         movie
@@ -254,6 +281,10 @@ impl SwfMovie {
 
     pub fn frame_rate(&self) -> Fixed8 {
         self.header.frame_rate()
+    }
+
+    pub fn is_movie(&self) -> bool {
+        self.is_movie
     }
 }
 

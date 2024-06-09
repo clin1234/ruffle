@@ -5,7 +5,9 @@ use crate::avm1::object::NativeObject;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{globals, ArrayObject, Object, ScriptObject, TObject, Value};
 use crate::context::GcContext;
-use crate::display_object::{AutoSizeMode, EditText, TDisplayObject, TextSelection};
+use crate::display_object::{
+    AutoSizeMode, EditText, TDisplayObject, TInteractiveObject, TextSelection,
+};
 use crate::font::round_down_to_pixel;
 use crate::html::TextFormat;
 use crate::string::{AvmString, WStr};
@@ -75,8 +77,11 @@ const PROTO_DECLS: &[Declaration] = declare_properties! {
     "length" => property(tf_getter!(length));
     "maxhscroll" => property(tf_getter!(maxhscroll));
     "maxscroll" => property(tf_getter!(maxscroll));
+    "maxChars" => property(tf_getter!(max_chars), tf_setter!(set_max_chars));
+    "mouseWheelEnabled" => property(tf_getter!(mouse_wheel_enabled), tf_setter!(set_mouse_wheel_enabled));
     "multiline" => property(tf_getter!(multiline), tf_setter!(set_multiline));
     "password" => property(tf_getter!(password), tf_setter!(set_password));
+    "restrict" => property(tf_getter!(restrict), tf_setter!(set_restrict));
     "scroll" => property(tf_getter!(scroll), tf_setter!(set_scroll));
     "selectable" => property(tf_getter!(selectable), tf_setter!(set_selectable));
     "text" => property(tf_getter!(text), tf_setter!(set_text));
@@ -90,6 +95,8 @@ const PROTO_DECLS: &[Declaration] = declare_properties! {
     "gridFitType" => property(tf_getter!(grid_fit_type), tf_setter!(set_grid_fit_type));
     "sharpness" => property(tf_getter!(sharpness), tf_setter!(set_sharpness));
     "thickness" => property(tf_getter!(thickness), tf_setter!(set_thickness));
+    // NOTE: `tabEnabled` is not a built-in property of TextField.
+    "tabIndex" => property(tf_getter!(tab_index), tf_setter!(set_tab_index); VERSION_6);
 };
 
 /// Implements `TextField`
@@ -110,6 +117,7 @@ pub fn create_proto<'gc>(
     define_properties_on(PROTO_DECLS, context, object, fn_proto);
     object.into()
 }
+
 pub fn password<'gc>(
     this: EditText<'gc>,
     _activation: &mut Activation<'_, 'gc>,
@@ -493,6 +501,23 @@ pub fn text_height<'gc>(
     Ok(round_down_to_pixel(metrics.1).to_pixels().into())
 }
 
+pub fn mouse_wheel_enabled<'gc>(
+    this: EditText<'gc>,
+    _activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(this.is_mouse_wheel_enabled().into())
+}
+
+pub fn set_mouse_wheel_enabled<'gc>(
+    this: EditText<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    let is_enabled = value.as_bool(activation.swf_version());
+    this.set_mouse_wheel_enabled(is_enabled, &mut activation.context);
+    Ok(())
+}
+
 pub fn multiline<'gc>(
     this: EditText<'gc>,
     _activation: &mut Activation<'_, 'gc>,
@@ -677,6 +702,28 @@ pub fn maxscroll<'gc>(
     Ok(this.maxscroll().into())
 }
 
+pub fn set_max_chars<'gc>(
+    this: EditText<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    let input = value.coerce_to_i32(activation)?;
+    this.set_max_chars(input, &mut activation.context);
+    Ok(())
+}
+
+pub fn max_chars<'gc>(
+    this: EditText<'gc>,
+    _activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let max = if this.max_chars() != 0 {
+        this.max_chars().into()
+    } else {
+        Value::Null
+    };
+    Ok(max)
+}
+
 pub fn bottom_scroll<'gc>(
     this: EditText<'gc>,
     _activation: &mut Activation<'_, 'gc>,
@@ -834,5 +881,70 @@ fn set_filters<'gc>(
         }
     }
     this.set_filters(activation.context.gc_context, filters);
+    Ok(())
+}
+
+fn restrict<'gc>(
+    this: EditText<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    match this.restrict() {
+        Some(value) => Ok(AvmString::new(activation.context.gc_context, value).into()),
+        None => Ok(Value::Null),
+    }
+}
+
+fn set_restrict<'gc>(
+    this: EditText<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    match value {
+        Value::Undefined | Value::Null => {
+            this.set_restrict(None, &mut activation.context);
+        }
+        _ => {
+            let text = value.coerce_to_string(activation)?;
+            if text.is_empty() {
+                // According to docs, an empty string means that you cannot enter any character,
+                // but according to reality, an empty string is equivalent to null in AVM1.
+                this.set_restrict(None, &mut activation.context);
+            } else {
+                this.set_restrict(Some(&text), &mut activation.context);
+            }
+        }
+    };
+    Ok(())
+}
+
+pub fn tab_index<'gc>(
+    this: EditText<'gc>,
+    _activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(index) = this.as_interactive().and_then(|this| this.tab_index()) {
+        Ok(Value::Number(index as u32 as f64))
+    } else {
+        Ok(Value::Undefined)
+    }
+}
+
+pub fn set_tab_index<'gc>(
+    this: EditText<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    if let Some(this) = this.as_interactive() {
+        let value = match value {
+            Value::Undefined | Value::Null => None,
+            _ => {
+                // `tabIndex` is u32 in TextField, compared to i32 in Button and MovieClip,
+                // but that is only a data representation difference,
+                // as both are interpreted as i32.
+                let u32_value = value.coerce_to_u32(activation)?;
+                Some(u32_value as i32)
+            }
+        };
+        this.set_tab_index(&mut activation.context, value);
+    }
     Ok(())
 }

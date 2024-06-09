@@ -4,11 +4,12 @@
 
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
+    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
 };
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl, BitmapSource, PixelRegion, PixelSnapping,
-    SyncHandle,
+    RgbaBufRead, SyncHandle,
 };
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::error::Error as BitmapError;
@@ -174,7 +175,11 @@ fn as_registry_data(handle: &BitmapHandle) -> &RegistryData {
 const MAX_GRADIENT_COLORS: usize = 15;
 
 impl WebGlRenderBackend {
-    pub fn new(canvas: &HtmlCanvasElement, is_transparent: bool) -> Result<Self, Error> {
+    pub fn new(
+        canvas: &HtmlCanvasElement,
+        is_transparent: bool,
+        quality: StageQuality,
+    ) -> Result<Self, Error> {
         // Create WebGL context.
         let options = [
             ("stencil", JsValue::TRUE),
@@ -199,13 +204,7 @@ impl WebGlRenderBackend {
                 .map_err(|_| Error::CantCreateGLContext)?;
 
             // Determine MSAA sample count.
-            // Default to 4x MSAA on desktop, 2x on mobile/tablets.
-            let mut msaa_sample_count = if ruffle_web_common::is_mobile_or_tablet() {
-                log::info!("Running on a mobile device; defaulting to 2x MSAA");
-                2
-            } else {
-                4
-            };
+            let mut msaa_sample_count = quality.sample_count().min(4);
 
             // Ensure that we don't exceed the max MSAA of this device.
             if let Ok(max_samples) = gl2.get_parameter(Gl2::MAX_SAMPLES) {
@@ -573,8 +572,8 @@ impl WebGlRenderBackend {
             .shape_tessellator
             .tessellate_shape(shape, bitmap_source);
 
-        let mut draws = Vec::with_capacity(lyon_mesh.len());
-        for draw in lyon_mesh {
+        let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
+        for draw in lyon_mesh.draws {
             let num_indices = draw.indices.len() as i32;
             let num_mask_indices = draw.mask_index_count as i32;
 
@@ -600,7 +599,7 @@ impl WebGlRenderBackend {
 
             let program = match draw.draw_type {
                 TessDrawType::Color => &self.color_program,
-                TessDrawType::Gradient(_) => &self.gradient_program,
+                TessDrawType::Gradient { .. } => &self.gradient_program,
                 TessDrawType::Bitmap(_) => &self.bitmap_program,
             };
 
@@ -651,8 +650,11 @@ impl WebGlRenderBackend {
                     num_indices,
                     num_mask_indices,
                 },
-                TessDrawType::Gradient(gradient) => Draw {
-                    draw_type: DrawType::Gradient(Box::new(Gradient::from(gradient))),
+                TessDrawType::Gradient { matrix, gradient } => Draw {
+                    draw_type: DrawType::Gradient(Box::new(Gradient::new(
+                        lyon_mesh.gradients[gradient].clone(), // TODO: Gradient deduplication
+                        matrix,
+                    ))),
                     vao,
                     vertex_buffer: Buffer {
                         gl: self.gl.clone(),
@@ -1078,7 +1080,10 @@ impl RenderBackend for WebGlRenderBackend {
         Ok(())
     }
 
-    fn create_context3d(&mut self) -> Result<Box<dyn Context3D>, BitmapError> {
+    fn create_context3d(
+        &mut self,
+        _profile: Context3DProfile,
+    ) -> Result<Box<dyn Context3D>, BitmapError> {
         Err(BitmapError::Unimplemented("createContext3D".into()))
     }
     fn context3d_present(&mut self, _context: &mut dyn Context3D) -> Result<(), BitmapError> {
@@ -1131,12 +1136,22 @@ impl RenderBackend for WebGlRenderBackend {
         ))
     }
 
+    fn resolve_sync_handle(
+        &mut self,
+        _handle: Box<dyn SyncHandle>,
+        _with_rgba: RgbaBufRead,
+    ) -> Result<(), ruffle_render::error::Error> {
+        Err(ruffle_render::error::Error::Unimplemented(
+            "Sync handle resolution".into(),
+        ))
+    }
+
     fn run_pixelbender_shader(
         &mut self,
         _handle: ruffle_render::pixel_bender::PixelBenderShaderHandle,
         _arguments: &[ruffle_render::pixel_bender::PixelBenderShaderArgument],
-        _target: BitmapHandle,
-    ) -> Result<Box<dyn SyncHandle>, BitmapError> {
+        _target: &PixelBenderTarget,
+    ) -> Result<PixelBenderOutput, BitmapError> {
         Err(BitmapError::Unimplemented("run_pixelbender_shader".into()))
     }
 
@@ -1525,8 +1540,8 @@ struct Gradient {
     interpolation: swf::GradientInterpolation,
 }
 
-impl From<TessGradient> for Gradient {
-    fn from(gradient: TessGradient) -> Self {
+impl Gradient {
+    fn new(gradient: TessGradient, matrix: [[f32; 3]; 3]) -> Self {
         // TODO: Support more than MAX_GRADIENT_COLORS.
         let num_colors = gradient.records.len().min(MAX_GRADIENT_COLORS);
         let mut ratios = [0.0; MAX_GRADIENT_COLORS];
@@ -1555,7 +1570,7 @@ impl From<TessGradient> for Gradient {
         }
 
         Self {
-            matrix: gradient.matrix,
+            matrix,
             gradient_type: match gradient.gradient_type {
                 GradientType::Linear => 0,
                 GradientType::Radial => 1,

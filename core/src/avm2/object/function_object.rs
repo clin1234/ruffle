@@ -1,7 +1,7 @@
 //! Function object impl
 
 use crate::avm2::activation::Activation;
-use crate::avm2::function::Executable;
+use crate::avm2::function::BoundMethod;
 use crate::avm2::method::{Method, NativeMethod};
 use crate::avm2::object::script_object::{ScriptObject, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
@@ -31,6 +31,7 @@ pub fn function_allocator<'gc>(
             method: |_, _, _| Ok(Value::Undefined),
             name: "<Empty Function>",
             signature: vec![],
+            resolved_signature: GcCell::new(activation.context.gc_context, None),
             return_type: Multiname::any(activation.context.gc_context),
             is_variadic: true,
         },
@@ -40,7 +41,7 @@ pub fn function_allocator<'gc>(
         activation.context.gc_context,
         FunctionObjectData {
             base,
-            exec: Executable::from_method(
+            exec: BoundMethod::from_method(
                 Method::Native(dummy),
                 activation.create_scopechain(),
                 None,
@@ -65,6 +66,7 @@ impl fmt::Debug for FunctionObject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunctionObject")
             .field("ptr", &self.0.as_ptr())
+            .field("name", &self.0.try_read().map(|r| r.exec.debug_full_name()))
             .finish()
     }
 }
@@ -76,7 +78,7 @@ pub struct FunctionObjectData<'gc> {
     base: ScriptObjectData<'gc>,
 
     /// Executable code
-    exec: Executable<'gc>,
+    exec: BoundMethod<'gc>,
 
     /// Attached prototype (note: not the same thing as base object's proto)
     prototype: Option<Object<'gc>>,
@@ -118,7 +120,7 @@ impl<'gc> FunctionObject<'gc> {
         subclass_object: Option<ClassObject<'gc>>,
     ) -> FunctionObject<'gc> {
         let fn_class = activation.avm2().classes().function;
-        let exec = Executable::from_method(method, scope, receiver, subclass_object);
+        let exec = BoundMethod::from_method(method, scope, receiver, subclass_object);
 
         FunctionObject(GcCell::new(
             activation.context.gc_context,
@@ -156,10 +158,6 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn to_string(&self, _activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok("function Function() {}".into())
-    }
-
     fn to_locale_string(
         &self,
         activation: &mut Activation<'_, 'gc>,
@@ -171,7 +169,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         Ok(Value::Object(Object::from(*self)))
     }
 
-    fn as_executable(&self) -> Option<Ref<Executable<'gc>>> {
+    fn as_executable(&self) -> Option<Ref<BoundMethod<'gc>>> {
         Some(Ref::map(self.0.read(), |r| &r.exec))
     }
 

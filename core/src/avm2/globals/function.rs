@@ -8,9 +8,7 @@ use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::object::{function_allocator, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
-use crate::avm2::Multiname;
 use crate::avm2::QName;
-use gc_arena::GcCell;
 
 /// Implements `Function`'s instance initializer.
 pub fn instance_init<'gc>(
@@ -78,6 +76,30 @@ pub fn class_init<'gc>(
         .into(),
         activation,
     )?;
+    function_proto.set_string_property_local(
+        "toString",
+        FunctionObject::from_method(
+            activation,
+            Method::from_builtin(to_string, "toString", activation.context.gc_context),
+            scope,
+            None,
+            Some(this_class),
+        )
+        .into(),
+        activation,
+    )?;
+    function_proto.set_string_property_local(
+        "toLocaleString",
+        FunctionObject::from_method(
+            activation,
+            Method::from_builtin(to_string, "toLocaleString", activation.context.gc_context),
+            scope,
+            None,
+            Some(this_class),
+        )
+        .into(),
+        activation,
+    )?;
     function_proto.set_local_property_is_enumerable(
         activation.context.gc_context,
         "call".into(),
@@ -86,6 +108,16 @@ pub fn class_init<'gc>(
     function_proto.set_local_property_is_enumerable(
         activation.context.gc_context,
         "apply".into(),
+        false,
+    );
+    function_proto.set_local_property_is_enumerable(
+        activation.context.gc_context,
+        "toString".into(),
+        false,
+    );
+    function_proto.set_local_property_is_enumerable(
+        activation.context.gc_context,
+        "toLocaleString".into(),
         false,
     );
 
@@ -137,6 +169,15 @@ fn apply<'gc>(
     func.call(this, &resolved_args, activation)
 }
 
+/// Implements `Function.prototype.toString` and `Function.prototype.toLocaleString`
+fn to_string<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    _this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok("function Function() {}".into())
+}
+
 fn length<'gc>(
     _activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
@@ -179,21 +220,22 @@ fn set_prototype<'gc>(
 }
 
 /// Construct `Function`'s class.
-pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_class<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    object_classdef: Class<'gc>,
+) -> Class<'gc> {
     let gc_context = activation.context.gc_context;
     let function_class = Class::new(
-        QName::new(activation.avm2().public_namespace, "Function"),
-        Some(Multiname::new(activation.avm2().public_namespace, "Object")),
+        QName::new(activation.avm2().public_namespace_base_version, "Function"),
+        Some(object_classdef),
         Method::from_builtin(instance_init, "<Function instance initializer>", gc_context),
         Method::from_builtin(class_init, "<Function class initializer>", gc_context),
         gc_context,
     );
 
-    let mut write = function_class.write(gc_context);
-
     // Fixed traits (in AS3 namespace)
     const AS3_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[("call", call), ("apply", apply)];
-    write.define_builtin_instance_methods(
+    function_class.define_builtin_instance_methods(
         gc_context,
         activation.avm2().as3_namespace,
         AS3_INSTANCE_METHODS,
@@ -207,25 +249,29 @@ pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Cl
         ("prototype", Some(prototype), Some(set_prototype)),
         ("length", Some(length), None),
     ];
-    write.define_builtin_instance_properties(
+    function_class.define_builtin_instance_properties(
         gc_context,
-        activation.avm2().public_namespace,
+        activation.avm2().public_namespace_base_version,
         PUBLIC_INSTANCE_PROPERTIES,
     );
 
     const CONSTANTS_INT: &[(&str, i32)] = &[("length", 1)];
-    write.define_constant_int_class_traits(
-        activation.avm2().public_namespace,
+    function_class.define_constant_int_class_traits(
+        activation.avm2().public_namespace_base_version,
         CONSTANTS_INT,
         activation,
     );
 
-    write.set_instance_allocator(function_allocator);
-    write.set_call_handler(Method::from_builtin(
-        class_call,
-        "<Function call handler>",
+    function_class.set_instance_allocator(gc_context, function_allocator);
+    function_class.set_call_handler(
         gc_context,
-    ));
+        Method::from_builtin(class_call, "<Function call handler>", gc_context),
+    );
+
+    function_class.mark_traits_loaded(activation.context.gc_context);
+    function_class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
 
     function_class
 }

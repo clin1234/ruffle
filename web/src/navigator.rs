@@ -1,9 +1,10 @@
 //! Navigator backend for web
 use crate::SocketProxy;
-use async_channel::Receiver;
-use futures_util::{SinkExt, StreamExt};
+use async_channel::{Receiver, Sender};
+use futures_util::future::Either;
+use futures_util::{future, SinkExt, StreamExt};
 use gloo_net::websocket::{futures::WebSocket, Message};
-use js_sys::{Array, ArrayBuffer, Uint8Array};
+use js_sys::{Array, Uint8Array};
 use ruffle_core::backend::navigator::{
     async_return, create_fetch_error, create_specific_fetch_error, ErrorResponse, NavigationMethod,
     NavigatorBackend, OpenURLMode, OwnedFuture, Request, SuccessResponse,
@@ -12,18 +13,21 @@ use ruffle_core::config::NetworkingAccessMode;
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
-use std::sync::mpsc::Sender;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::layer::Layered;
 use tracing_subscriber::Registry;
 use tracing_wasm::WASMLayer;
 use url::{ParseError, Url};
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_streams::readable::ReadableStream;
 use web_sys::{
     window, Blob, BlobPropertyBag, HtmlFormElement, HtmlInputElement, Request as WebRequest,
-    RequestInit, Response as WebResponse,
+    RequestCredentials, RequestInit, Response as WebResponse,
 };
 
 pub struct WebNavigatorBackend {
@@ -34,8 +38,10 @@ pub struct WebNavigatorBackend {
     base_url: Option<Url>,
     open_url_mode: OpenURLMode,
     socket_proxies: Vec<SocketProxy>,
+    credential_allow_list: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl WebNavigatorBackend {
     pub fn new(
         allow_script_access: bool,
@@ -45,6 +51,7 @@ impl WebNavigatorBackend {
         log_subscriber: Arc<Layered<WASMLayer, Registry>>,
         open_url_mode: OpenURLMode,
         socket_proxies: Vec<SocketProxy>,
+        credential_allow_list: Vec<String>,
     ) -> Self {
         let window = web_sys::window().expect("window()");
 
@@ -87,6 +94,7 @@ impl WebNavigatorBackend {
             log_subscriber,
             open_url_mode,
             socket_proxies,
+            credential_allow_list,
         }
     }
 }
@@ -219,7 +227,7 @@ impl NavigatorBackend for WebNavigatorBackend {
         };
     }
 
-    fn fetch(&self, request: Request) -> OwnedFuture<SuccessResponse, ErrorResponse> {
+    fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         let url = match self.resolve_url(request.url()) {
             Ok(url) => {
                 if url.scheme() == "file" {
@@ -237,10 +245,25 @@ impl NavigatorBackend for WebNavigatorBackend {
             }
         };
 
+        let credentials = if let Some(host) = url.host_str() {
+            if self
+                .credential_allow_list
+                .iter()
+                .any(|allowed| allowed == &format!("{}://{}", url.scheme(), host))
+            {
+                RequestCredentials::Include
+            } else {
+                RequestCredentials::SameOrigin
+            }
+        } else {
+            RequestCredentials::SameOrigin
+        };
+
         Box::pin(async move {
             let mut init = RequestInit::new();
 
             init.method(&request.method().to_string());
+            init.credentials(credentials);
 
             if let Some((data, mime)) = request.body() {
                 let blob = Blob::new_with_buffer_source_sequence_and_options(
@@ -267,7 +290,7 @@ impl NavigatorBackend for WebNavigatorBackend {
                         "Unable to create request for",
                         url.as_str(),
                         "",
-                    )
+                    );
                 }
             };
 
@@ -302,36 +325,17 @@ impl NavigatorBackend for WebNavigatorBackend {
                     format!("HTTP status is not ok, got {}", response.status_text()),
                     status,
                     redirected,
+                    0,
                 );
                 return Err(ErrorResponse { url, error });
             }
 
-            let body: ArrayBuffer = JsFuture::from(response.array_buffer().map_err(|_| {
-                ErrorResponse {
-                    url: url.clone(),
-                    error: Error::FetchError("Got JS error".to_string()),
-                }
-            })?)
-            .await
-            .map_err(|_| ErrorResponse {
-                url: url.clone(),
-                error: Error::FetchError(
-                    "Could not allocate array buffer for response".to_string(),
-                ),
-            })?
-            .dyn_into()
-            .map_err(|_| ErrorResponse {
-                url: url.clone(),
-                error: Error::FetchError("array_buffer result wasn't an ArrayBuffer".to_string()),
-            })?;
-            let body = Uint8Array::new(&body).to_vec();
+            let wrapper: Box<dyn SuccessResponse> = Box::new(WebResponseWrapper {
+                response,
+                body_stream: None,
+            });
 
-            Ok(SuccessResponse {
-                url,
-                body,
-                status,
-                redirected,
-            })
+            Ok(wrapper)
         })
     }
 
@@ -383,7 +387,7 @@ impl NavigatorBackend for WebNavigatorBackend {
         else {
             tracing::warn!("Missing WebSocket proxy for host {}, port {}", host, port);
             sender
-                .send(SocketAction::Connect(handle, ConnectionState::Failed))
+                .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
                 .expect("working channel send");
             return;
         };
@@ -395,50 +399,147 @@ impl NavigatorBackend for WebNavigatorBackend {
             Err(e) => {
                 tracing::error!("Failed to create WebSocket, reason {:?}", e);
                 sender
-                    .send(SocketAction::Connect(handle, ConnectionState::Failed))
+                    .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
                     .expect("working channel send");
                 return;
             }
         };
 
-        let (mut sink, mut stream) = ws.split();
+        let (mut ws_write, mut ws_read) = ws.split();
         sender
-            .send(SocketAction::Connect(handle, ConnectionState::Connected))
+            .try_send(SocketAction::Connect(handle, ConnectionState::Connected))
             .expect("working channel send");
 
-        // Spawn future to handle incoming messages.
-        let stream_sender = sender.clone();
         self.spawn_future(Box::pin(async move {
-            while let Some(msg) = stream.next().await {
-                match msg {
-                    Ok(Message::Bytes(buf)) => stream_sender
-                        .send(SocketAction::Data(handle, buf))
-                        .expect("working channel send"),
-                    Ok(_) => tracing::warn!("Server sent unexpected text message"),
-                    Err(_) => {
-                        stream_sender
-                            .send(SocketAction::Close(handle))
-                            .expect("working channel send");
-                        return Ok(());
+            loop {
+                match future::select(ws_read.next(), std::pin::pin!(receiver.recv())).await {
+                    // Handle incoming messages.
+                    Either::Left((Some(msg), _)) => match msg {
+                        Ok(Message::Bytes(buf)) => sender
+                            .try_send(SocketAction::Data(handle, buf))
+                            .expect("working channel send"),
+                        Ok(_) => tracing::warn!("Server sent an unexpected text message"),
+                        Err(_) => {
+                            sender
+                                .try_send(SocketAction::Close(handle))
+                                .expect("working channel send");
+                            break;
+                        }
+                    },
+                    // Handle outgoing messages.
+                    Either::Right((Ok(msg), _)) => {
+                        if let Err(e) = ws_write.send(Message::Bytes(msg)).await {
+                            tracing::warn!("Failed to send message to WebSocket {}", e);
+                            sender
+                                .try_send(SocketAction::Close(handle))
+                                .expect("working channel send");
+                        }
                     }
-                }
+                    // The connection was closed.
+                    _ => break,
+                };
             }
+
+            let ws = ws_write
+                .reunite(ws_read)
+                .expect("both originate from the same websocket");
+            let _ = ws.close(None, None);
 
             Ok(())
         }));
+    }
+}
 
-        // Spawn future to handle outgoing messages.
-        self.spawn_future(Box::pin(async move {
-            while let Ok(msg) = receiver.recv().await {
-                if let Err(e) = sink.send(Message::Bytes(msg)).await {
-                    tracing::warn!("Failed to send message to WebSocket {}", e);
-                    sender
-                        .send(SocketAction::Close(handle))
-                        .expect("working channel send");
-                }
+struct WebResponseWrapper {
+    response: WebResponse,
+    body_stream: Option<Rc<RefCell<ReadableStream>>>,
+}
+
+impl SuccessResponse for WebResponseWrapper {
+    fn url(&self) -> Cow<str> {
+        Cow::Owned(self.response.url())
+    }
+
+    fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
+        Box::pin(async move {
+            let body = JsFuture::from(
+                self.response
+                    .array_buffer()
+                    .map_err(|_| Error::FetchError("Got JS error".to_string()))?,
+            )
+            .await
+            .map_err(|_| {
+                Error::FetchError("Could not allocate array buffer for response".to_string())
+            })?
+            .dyn_into()
+            .map_err(|_| {
+                Error::FetchError("array_buffer result wasn't an ArrayBuffer".to_string())
+            })?;
+            let body = Uint8Array::new(&body).to_vec();
+
+            Ok(body)
+        })
+    }
+
+    fn status(&self) -> u16 {
+        self.response.status()
+    }
+
+    fn redirected(&self) -> bool {
+        self.response.redirected()
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
+    fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error> {
+        if self.body_stream.is_none() {
+            let body = self.response.body();
+            if body.is_none() {
+                return Box::pin(async move { Ok(None) });
             }
 
-            Ok(())
-        }));
+            self.body_stream = Some(Rc::new(RefCell::new(ReadableStream::from_raw(
+                body.expect("body").unchecked_into(),
+            ))));
+        }
+
+        let body_stream = self.body_stream.clone().expect("web body stream");
+        Box::pin(async move {
+            let read_lock = body_stream.try_borrow_mut();
+            if read_lock.is_err() {
+                return Err(Error::FetchError(
+                    "Concurrent read operations on the same stream are not supported.".to_string(),
+                ));
+            }
+
+            let mut read_lock = read_lock.expect("web response reader");
+            let mut body_reader = read_lock.get_reader();
+
+            let chunk = body_reader.read();
+            match chunk.await {
+                Ok(Some(chunk)) => Ok(Some(Uint8Array::new(&chunk).to_vec())),
+                Ok(None) => Ok(None),
+                Err(_) => Err(Error::FetchError("Cannot read next chunk".to_string())), //TODO: JsValue to string?!
+            }
+        })
+    }
+
+    fn expected_length(&self) -> Result<Option<u64>, Error> {
+        let length = self
+            .response
+            .headers()
+            .get("Content-Length")
+            .map_err(|js_err| {
+                Error::FetchError(
+                    (js_err + JsValue::from(""))
+                        .as_string()
+                        .expect("JavaScript String addition to yield String"),
+                )
+            })?;
+
+        if let Some(length) = length {
+            Ok(Some(length.parse::<u64>()?))
+        } else {
+            Ok(None)
+        }
     }
 }

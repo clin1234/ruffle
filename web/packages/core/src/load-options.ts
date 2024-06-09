@@ -1,7 +1,7 @@
 /**
  * Represents the various types of auto-play behaviours that are supported.
  */
-export const enum AutoPlay {
+export enum AutoPlay {
     /**
      * The player should automatically play the movie as soon as it is loaded.
      *
@@ -35,7 +35,7 @@ export const enum AutoPlay {
  * When letterboxed, black bars will be rendered around the exterior
  * margins of the content.
  */
-export const enum Letterbox {
+export enum Letterbox {
     /**
      * The content will never be letterboxed.
      */
@@ -56,7 +56,7 @@ export const enum Letterbox {
  * When the player is muted, this controls whether or not Ruffle will show a
  * "click to unmute" overlay on top of the movie.
  */
-export const enum UnmuteOverlay {
+export enum UnmuteOverlay {
     /**
      * Show an overlay explaining that the movie is muted.
      */
@@ -71,7 +71,7 @@ export const enum UnmuteOverlay {
 /**
  * Console logging level.
  */
-export const enum LogLevel {
+export enum LogLevel {
     Error = "error",
     Warn = "warn",
     Info = "info",
@@ -82,7 +82,7 @@ export const enum LogLevel {
 /**
  * The window mode of a Ruffle player.
  */
-export const enum WindowMode {
+export enum WindowMode {
     /**
      * The Flash content is rendered in its own window and layering is done with the browser's
      * default behavior.
@@ -122,7 +122,7 @@ export const enum WindowMode {
  *
  * The available backends may change in future releases.
  */
-export const enum RenderBackend {
+export enum RenderBackend {
     /**
      * An [in-development API](https://caniuse.com/webgpu) that will be preferred if available in the future.
      * Should behave the same as wgpu-webgl, except with lower overhead and thus better performance.
@@ -155,7 +155,7 @@ export const enum RenderBackend {
 /**
  * Represents the various context menu options that are supported.
  */
-export const enum ContextMenu {
+export enum ContextMenu {
     /**
      * The context menu should appear when right-clicking or long-pressing
      * the Ruffle instance.
@@ -173,6 +173,21 @@ export const enum ContextMenu {
      * the Ruffle instance.
      */
     Off = "off",
+}
+
+/**
+ * Represents the player runtime to emulate.
+ */
+export enum PlayerRuntime {
+    /**
+     * Emulate Adobe AIR.
+     */
+    AIR = "air",
+
+    /**
+     * Emulate Adobe Flash Player.
+     */
+    FlashPlayer = "flashPlayer",
 }
 
 /**
@@ -198,7 +213,7 @@ export type Duration = SecsDuration | ObsoleteDuration;
 /**
  * The handling mode of links opening a new website.
  */
-export const enum OpenURLMode {
+export enum OpenURLMode {
     /**
      * Allow all links to open a new website.
      */
@@ -218,7 +233,7 @@ export const enum OpenURLMode {
 /**
  * The networking API access mode of the Ruffle player.
  */
-export const enum NetworkingAccessMode {
+export enum NetworkingAccessMode {
     /**
      * All networking APIs are permitted in the SWF file.
      */
@@ -265,6 +280,45 @@ export interface SocketProxy {
      * The proxy URL to use when SWF file tries to connect to the specified host and port.
      */
     proxyUrl: string;
+}
+
+/**
+ * Defines the names of the fonts to use for each "default" Flash device font.
+ *
+ * The name of each font provided will be used, in priority order.
+ *
+ * For example, defining `sans: ["Helvetica", "Arial"]` would use Helvetica if present, before trying Arial.
+ */
+export interface DefaultFonts {
+    /**
+     * `_sans`, a Sans-Serif font (similar to Helvetica or Arial)
+     */
+    sans?: Array<string>;
+
+    /**
+     * `_serif`, a Serif font (similar to Times Roman)
+     */
+    serif?: Array<string>;
+
+    /**
+     * `_typewriter`, a Monospace font (similar to Courier)
+     */
+    typewriter?: Array<string>;
+
+    /**
+     * `_ゴシック`, a Japanese Gothic font
+     */
+    japaneseGothic?: Array<string>;
+
+    /**
+     * `_等幅`, a Japanese Gothic Mono font
+     */
+    japaneseGothicMono?: Array<string>;
+
+    /**
+     * `_明朝`, a Japanese Mincho font
+     */
+    japaneseMincho?: Array<string>;
 }
 
 /**
@@ -467,6 +521,13 @@ export interface BaseLoadOptions {
     forceScale?: boolean;
 
     /**
+     * If set to true, the Stage's displayState can be changed
+     *
+     * @default false
+     */
+    allowFullscreen?: boolean;
+
+    /**
      * Sets and locks the player's frame rate, overriding the movie's frame rate.
      *
      * @default null
@@ -561,6 +622,51 @@ export interface BaseLoadOptions {
      * @default []
      */
     socketProxy?: Array<SocketProxy>;
+
+    /**
+     * An array of font URLs to eagerly load and provide to Ruffle.
+     *
+     * These will be fetched by the browser as part of the loading of Flash content, which may slow down load times.
+     *
+     * Currently only SWFs are supported, and each font embedded within that SWF will be used as device font by Flash content.
+     *
+     * If any URL fails to load (either it's an invalid file, or a network error occurs), Ruffle will log an error but continue without it.
+     *
+     * @default []
+     */
+    fontSources?: Array<string>;
+
+    /**
+     * The font names to use for each "default" Flash device font.
+     *
+     * @default {}
+     */
+    defaultFonts?: DefaultFonts;
+
+    /**
+     * An array of origins that credentials may be sent to.
+     * Credentials are cookies, authorization headers, or TLS client certificates.
+     *
+     * Entries should include the protocol and host, for example `https://example.org` or `http://subdomain.example.org`.
+     *
+     * Cookies will always be sent to the same origin as the page the content was loaded on.
+     * If you configure this to send cookies to an origin but that origin does not configure CORS to allow it,
+     * then requests will start failing due to CORS.
+     * See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Credentials.
+     *
+     * This directly corresponds to https://developer.mozilla.org/en-US/docs/Web/API/fetch#credentials
+     * Every request will be `same-origin` unless specified here, in which case it will be `include`.
+     *
+     * @default []
+     */
+    credentialAllowList?: Array<string>;
+
+    /**
+     * The player runtime to emulate
+     *
+     * This allows you to emulate Adobe AIR or Adobe Flash Player.
+     */
+    playerRuntime?: PlayerRuntime;
 }
 
 /**

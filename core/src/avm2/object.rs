@@ -7,7 +7,7 @@ use crate::avm2::class::Class;
 use crate::avm2::domain::Domain;
 use crate::avm2::error;
 use crate::avm2::events::{DispatchList, Event};
-use crate::avm2::function::Executable;
+use crate::avm2::function::{exec, BoundMethod};
 use crate::avm2::property::Property;
 use crate::avm2::regexp::RegExp;
 use crate::avm2::value::{Hint, Value};
@@ -40,16 +40,21 @@ mod dispatch_object;
 mod domain_object;
 mod error_object;
 mod event_object;
+mod file_reference_object;
+mod font_object;
 mod function_object;
 mod index_buffer_3d_object;
 mod loaderinfo_object;
+mod local_connection_object;
 mod namespace_object;
+mod net_connection_object;
 mod netstream_object;
 mod primitive_object;
 mod program_3d_object;
 mod proxy_object;
 mod qname_object;
 mod regexp_object;
+mod responder_object;
 mod script_object;
 mod shader_data_object;
 mod socket_object;
@@ -83,6 +88,10 @@ pub use crate::avm2::object::domain_object::{
 };
 pub use crate::avm2::object::error_object::{error_allocator, ErrorObject, ErrorObjectWeak};
 pub use crate::avm2::object::event_object::{event_allocator, EventObject, EventObjectWeak};
+pub use crate::avm2::object::file_reference_object::{
+    file_reference_allocator, FileReference, FileReferenceObject, FileReferenceObjectWeak,
+};
+pub use crate::avm2::object::font_object::{font_allocator, FontObject, FontObjectWeak};
 pub use crate::avm2::object::function_object::{
     function_allocator, FunctionObject, FunctionObjectWeak,
 };
@@ -92,8 +101,14 @@ pub use crate::avm2::object::index_buffer_3d_object::{
 pub use crate::avm2::object::loaderinfo_object::{
     loader_info_allocator, LoaderInfoObject, LoaderInfoObjectWeak, LoaderStream,
 };
+pub use crate::avm2::object::local_connection_object::{
+    local_connection_allocator, LocalConnectionObject, LocalConnectionObjectWeak,
+};
 pub use crate::avm2::object::namespace_object::{
     namespace_allocator, NamespaceObject, NamespaceObjectWeak,
+};
+pub use crate::avm2::object::net_connection_object::{
+    net_connection_allocator, NetConnectionObject, NetConnectionObjectWeak,
 };
 pub use crate::avm2::object::netstream_object::{
     netstream_allocator, NetStreamObject, NetStreamObjectWeak,
@@ -105,13 +120,16 @@ pub use crate::avm2::object::program_3d_object::{Program3DObject, Program3DObjec
 pub use crate::avm2::object::proxy_object::{proxy_allocator, ProxyObject, ProxyObjectWeak};
 pub use crate::avm2::object::qname_object::{q_name_allocator, QNameObject, QNameObjectWeak};
 pub use crate::avm2::object::regexp_object::{reg_exp_allocator, RegExpObject, RegExpObjectWeak};
+pub use crate::avm2::object::responder_object::{
+    responder_allocator, ResponderObject, ResponderObjectWeak,
+};
 pub use crate::avm2::object::script_object::{ScriptObject, ScriptObjectData, ScriptObjectWeak};
 pub use crate::avm2::object::shader_data_object::{
     shader_data_allocator, ShaderDataObject, ShaderDataObjectWeak,
 };
 pub use crate::avm2::object::socket_object::{socket_allocator, SocketObject, SocketObjectWeak};
 pub use crate::avm2::object::sound_object::{
-    sound_allocator, QueuedPlay, SoundData, SoundObject, SoundObjectWeak,
+    sound_allocator, QueuedPlay, SoundObject, SoundObjectWeak,
 };
 pub use crate::avm2::object::soundchannel_object::{
     sound_channel_allocator, SoundChannelObject, SoundChannelObjectWeak,
@@ -132,6 +150,7 @@ pub use crate::avm2::object::xml_list_object::{
     xml_list_allocator, E4XOrXml, XmlListObject, XmlListObjectWeak,
 };
 pub use crate::avm2::object::xml_object::{xml_allocator, XmlObject, XmlObjectWeak};
+use crate::font::Font;
 
 /// Represents an object that can be directly interacted with by the AVM2
 /// runtime.
@@ -172,13 +191,18 @@ pub use crate::avm2::object::xml_object::{xml_allocator, XmlObject, XmlObjectWea
         TextureObject(TextureObject<'gc>),
         Program3DObject(Program3DObject<'gc>),
         NetStreamObject(NetStreamObject<'gc>),
+        NetConnectionObject(NetConnectionObject<'gc>),
+        ResponderObject(ResponderObject<'gc>),
         ShaderDataObject(ShaderDataObject<'gc>),
-        SocketObject(SocketObject<'gc>)
+        SocketObject(SocketObject<'gc>),
+        FileReferenceObject(FileReferenceObject<'gc>),
+        FontObject(FontObject<'gc>),
+        LocalConnectionObject(LocalConnectionObject<'gc>),
     }
 )]
 pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy {
     /// Get the base of this object.
-    /// Any trait method implementations that were not overrided will forward the call to this instead.
+    /// Any trait method implementations that were not overridden will forward the call to this instead.
     fn base(&self) -> Ref<ScriptObjectData<'gc>>;
     fn base_mut(&self, mc: &Mutation<'gc>) -> RefMut<ScriptObjectData<'gc>>;
 
@@ -225,15 +249,16 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
                 if let Some(bound_method) = self.get_bound_method(disp_id) {
                     return Ok(bound_method.into());
                 }
-                let vtable = self.vtable().unwrap();
-                if let Some(bound_method) =
-                    vtable.make_bound_method(activation, self.into(), disp_id)
-                {
-                    self.install_bound_method(activation.context.gc_context, disp_id, bound_method);
-                    Ok(bound_method.into())
-                } else {
-                    Err("Method not found".into())
-                }
+
+                let bound_method = self
+                    .vtable()
+                    .expect("object to have a vtable")
+                    .make_bound_method(activation, self.into(), disp_id)
+                    .ok_or_else(|| format!("Method not found with id {disp_id}"))?;
+
+                self.install_bound_method(activation.context.gc_context, disp_id, bound_method);
+
+                Ok(bound_method.into())
             }
             Some(Property::Virtual { get: Some(get), .. }) => {
                 self.call_method(get, &[], activation)
@@ -257,9 +282,15 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         self.get_property(
-            &Multiname::new(activation.avm2().public_namespace, name),
+            &Multiname::new(activation.avm2().find_public_namespace(), name),
             activation,
         )
+    }
+
+    /// Purely an optimization for "array-like" access. This should return
+    /// `None` when the lookup needs to be forwarded to the base or throw.
+    fn get_index_property(self, _index: usize) -> Option<Value<'gc>> {
+        None
     }
 
     /// Set a local property of the object. The Multiname should always be public.
@@ -287,7 +318,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
-        let name = Multiname::new(activation.avm2().public_namespace, name);
+        let name = Multiname::new(activation.avm2().public_namespace_vm_internal, name);
         self.set_property_local(&name, value, activation)
     }
 
@@ -354,7 +385,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
         self.set_property(
-            &Multiname::new(activation.avm2().public_namespace, name),
+            &Multiname::new(activation.avm2().public_namespace_vm_internal, name),
             value,
             activation,
         )
@@ -471,43 +502,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
                 obj.call(Value::from(self.into()), arguments, activation)
             }
-            Some(Property::Method { disp_id }) => {
-                let vtable = self.vtable().unwrap();
-                if let Some(ClassBoundMethod {
-                    class,
-                    scope,
-                    method,
-                }) = vtable.get_full_method(disp_id)
-                {
-                    if !method.needs_arguments_object() {
-                        Executable::from_method(method, scope, None, Some(class)).exec(
-                            Value::from(self.into()),
-                            arguments,
-                            activation,
-                            class.into(), //Deliberately invalid.
-                        )
-                    } else {
-                        if let Some(bound_method) = self.get_bound_method(disp_id) {
-                            return bound_method.call(
-                                Value::from(self.into()),
-                                arguments,
-                                activation,
-                            );
-                        }
-                        let bound_method = vtable
-                            .make_bound_method(activation, self.into(), disp_id)
-                            .unwrap();
-                        self.install_bound_method(
-                            activation.context.gc_context,
-                            disp_id,
-                            bound_method,
-                        );
-                        bound_method.call(Value::from(self.into()), arguments, activation)
-                    }
-                } else {
-                    Err("Method not found".into())
-                }
-            }
+            Some(Property::Method { disp_id }) => self.call_method(disp_id, arguments, activation),
             Some(Property::Virtual { get: Some(get), .. }) => {
                 let obj = self.call_method(get, &[], activation)?.as_callable(
                     activation,
@@ -538,7 +533,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         self.call_property(
-            &Multiname::new(activation.avm2().public_namespace, name),
+            &Multiname::new(activation.avm2().find_public_namespace(), name),
             arguments,
             activation,
         )
@@ -567,37 +562,60 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         base.set_slot(id, value, activation.gc())
     }
 
-    /// Initialize a slot by its index.
-    fn init_slot(self, id: u32, value: Value<'gc>, mc: &Mutation<'gc>) -> Result<(), Error<'gc>> {
+    fn set_slot_no_coerce(
+        self,
+        id: u32,
+        value: Value<'gc>,
+        mc: &Mutation<'gc>,
+    ) -> Result<(), Error<'gc>> {
         let mut base = self.base_mut(mc);
 
-        base.init_slot(id, value, mc)
+        base.set_slot(id, value, mc)
     }
 
     /// Call a method by its index.
     ///
     /// This directly corresponds with the AVM2 operation `callmethod`.
-    #[allow(unused_mut)] //Not unused.
     fn call_method(
-        mut self,
+        self,
         id: u32,
         arguments: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if self.get_bound_method(id).is_none() {
-            if let Some(vtable) = self.vtable() {
-                if let Some(bound_method) = vtable.make_bound_method(activation, self.into(), id) {
-                    self.install_bound_method(activation.context.gc_context, id, bound_method);
-                }
-            }
+        if let Some(bound_method) = self.get_bound_method(id) {
+            return bound_method.call(Value::from(self.into()), arguments, activation);
         }
 
-        let bound_method = self.get_bound_method(id);
-        if let Some(method_object) = bound_method {
-            return method_object.call(Value::from(self.into()), arguments, activation);
+        let full_method = self
+            .vtable()
+            .expect("method to have a vtable")
+            .get_full_method(id)
+            .ok_or_else(|| format!("Cannot call unknown method id {id}"))?;
+
+        // Execute immediately if this method doesn't require binding
+        if !full_method.method.needs_arguments_object() {
+            let ClassBoundMethod {
+                method,
+                scope,
+                class,
+            } = full_method;
+
+            return exec(
+                method,
+                scope.expect("Scope should exist here"),
+                self.into(),
+                class,
+                arguments,
+                activation,
+                self.into(), // Callee deliberately invalid.
+            );
         }
 
-        Err(format!("Cannot call unknown method id {id}").into())
+        let bound_method = VTable::bind_method(activation, self.into(), full_method);
+
+        self.install_bound_method(activation.context.gc_context, id, bound_method);
+
+        bound_method.call(Value::from(self.into()), arguments, activation)
     }
 
     /// Implements the `in` opcode and AS3 operator.
@@ -617,7 +635,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         if self.has_own_property(name) {
             true
         } else if let Some(proto) = self.proto() {
-            proto.has_own_property(name)
+            proto.has_property(name)
         } else {
             false
         }
@@ -629,7 +647,10 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         name: impl Into<AvmString<'gc>>,
         activation: &mut Activation<'_, 'gc>,
     ) -> bool {
-        self.has_property(&Multiname::new(activation.avm2().public_namespace, name))
+        self.has_property(&Multiname::new(
+            activation.avm2().find_public_namespace(),
+            name,
+        ))
     }
 
     /// Indicates whether or not a property or trait exists on an object and is
@@ -644,7 +665,10 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         name: impl Into<AvmString<'gc>>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<bool, Error<'gc>> {
-        Ok(self.has_own_property(&Multiname::new(activation.avm2().public_namespace, name)))
+        Ok(self.has_own_property(&Multiname::new(
+            activation.avm2().find_public_namespace(),
+            name,
+        )))
     }
 
     /// Returns true if an object has one or more traits of a given name.
@@ -689,7 +713,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
             None => {
                 if self
                     .instance_of_class_definition()
-                    .map(|c| c.read().is_sealed())
+                    .map(|c| c.is_sealed())
                     .unwrap_or(false)
                 {
                     Ok(false)
@@ -715,7 +739,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         activation: &mut Activation<'_, 'gc>,
         name: impl Into<AvmString<'gc>>,
     ) -> Result<bool, Error<'gc>> {
-        let name = Multiname::new(activation.avm2().public_namespace, name);
+        let name = Multiname::new(activation.avm2().public_namespace_base_version, name);
         self.delete_property(activation, &name)
     }
 
@@ -945,14 +969,10 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     fn to_string(&self, activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
         let class_name = self
             .instance_of_class_definition()
-            .map(|c| c.read().name().local_name())
+            .map(|c| c.name().local_name())
             .unwrap_or_else(|| "Object".into());
 
-        Ok(AvmString::new_utf8(
-            activation.context.gc_context,
-            format!("[object {class_name}]"),
-        )
-        .into())
+        Ok(AvmString::new_utf8(activation.gc(), format!("[object {class_name}]")).into())
     }
 
     /// Implement the result of calling `Object.prototype.toLocaleString` on this
@@ -969,7 +989,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     ) -> Result<Value<'gc>, Error<'gc>> {
         let class_name = self
             .instance_of_class_definition()
-            .map(|c| c.read().name().local_name())
+            .map(|c| c.name().local_name())
             .unwrap_or_else(|| "Object".into());
 
         Ok(AvmString::new_utf8(
@@ -1065,20 +1085,13 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     ///
     /// The given object should be the class object for the given type we are
     /// checking against this object.
-    fn is_of_type(
-        &self,
-        test_class: GcCell<'gc, Class<'gc>>,
-        context: &mut UpdateContext<'_, 'gc>,
-    ) -> bool {
+    fn is_of_type(&self, test_class: Class<'gc>, context: &mut UpdateContext<'_, 'gc>) -> bool {
         let my_class = self.instance_of();
 
         // ES3 objects are not class instances but are still treated as
         // instances of Object, which is an ES4 class.
         if my_class.is_none()
-            && GcCell::ptr_eq(
-                test_class,
-                context.avm2.classes().object.inner_class_definition(),
-            )
+            && test_class == context.avm2.classes().object.inner_class_definition()
         {
             true
         } else if let Some(my_class) = my_class {
@@ -1110,14 +1123,14 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     }
 
     /// Get this object's class's `Class`, if it has one.
-    fn instance_of_class_definition(&self) -> Option<GcCell<'gc, Class<'gc>>> {
+    fn instance_of_class_definition(&self) -> Option<Class<'gc>> {
         self.instance_of().map(|cls| cls.inner_class_definition())
     }
 
     /// Get this object's class's name, formatted for debug output.
     fn instance_of_class_name(&self, mc: &Mutation<'gc>) -> AvmString<'gc> {
         self.instance_of_class_definition()
-            .map(|r| r.read().name().to_qualified_name(mc))
+            .map(|r| r.name().to_qualified_name(mc))
             .unwrap_or_else(|| "<Unknown type>".into())
     }
 
@@ -1134,14 +1147,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         base.set_vtable(vtable);
     }
 
-    // Duplicates the vtable for modification without subclassing
-    // Note: this detaches the vtable from the original class.
-    fn fork_vtable(&self, mc: &Mutation<'gc>) {
-        let mut base = self.base_mut(mc);
-        let vtable = base.vtable().unwrap().duplicate(mc);
-        base.set_vtable(vtable);
-    }
-
     /// Try to corece this object into a `ClassObject`.
     fn as_class_object(&self) -> Option<ClassObject<'gc>> {
         None
@@ -1151,8 +1156,8 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         None
     }
 
-    /// Get this object's `Executable`, if it has one.
-    fn as_executable(&self) -> Option<Ref<Executable<'gc>>> {
+    /// Get this object's `BoundMethod`, if it has one.
+    fn as_executable(&self) -> Option<Ref<BoundMethod<'gc>>> {
         None
     }
 
@@ -1216,13 +1221,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         None
     }
 
-    /// Associate this object with a display object, if it can support such an
-    /// association.
-    ///
-    /// If not, then this function does nothing.
-    fn init_display_object(&self, _context: &mut UpdateContext<'_, 'gc>, _obj: DisplayObject<'gc>) {
-    }
-
     fn init_application_domain(&self, _mc: &Mutation<'gc>, _domain: Domain<'gc>) {
         panic!("Tried to init an application domain on a non-ApplicationDomain object!")
     }
@@ -1273,6 +1271,11 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Unwrap this object as a regexp.
     fn as_regexp(&self) -> Option<Ref<RegExp<'gc>>> {
+        None
+    }
+
+    /// Unwrap this object as a font.
+    fn as_font(&self) -> Option<Font<'gc>> {
         None
     }
 
@@ -1376,7 +1379,23 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         None
     }
 
+    fn as_responder(self) -> Option<ResponderObject<'gc>> {
+        None
+    }
+
+    fn as_net_connection(self) -> Option<NetConnectionObject<'gc>> {
+        None
+    }
+
     fn as_socket(&self) -> Option<SocketObject<'gc>> {
+        None
+    }
+
+    fn as_local_connection_object(&self) -> Option<LocalConnectionObject<'gc>> {
+        None
+    }
+
+    fn as_file_reference(&self) -> Option<FileReferenceObject<'gc>> {
         None
     }
 }
@@ -1423,8 +1442,13 @@ impl<'gc> Object<'gc> {
             Self::TextureObject(o) => WeakObject::TextureObject(TextureObjectWeak(Gc::downgrade(o.0))),
             Self::Program3DObject(o) => WeakObject::Program3DObject(Program3DObjectWeak(Gc::downgrade(o.0))),
             Self::NetStreamObject(o) => WeakObject::NetStreamObject(NetStreamObjectWeak(GcCell::downgrade(o.0))),
+            Self::NetConnectionObject(o) => WeakObject::NetConnectionObject(NetConnectionObjectWeak(Gc::downgrade(o.0))),
+            Self::ResponderObject(o) => WeakObject::ResponderObject(ResponderObjectWeak(GcCell::downgrade(o.0))),
             Self::ShaderDataObject(o) => WeakObject::ShaderDataObject(ShaderDataObjectWeak(Gc::downgrade(o.0))),
-            Self::SocketObject(o) => WeakObject::SocketObject(SocketObjectWeak(Gc::downgrade(o.0)))
+            Self::SocketObject(o) => WeakObject::SocketObject(SocketObjectWeak(Gc::downgrade(o.0))),
+            Self::FileReferenceObject(o) => WeakObject::FileReferenceObject(FileReferenceObjectWeak(Gc::downgrade(o.0))),
+            Self::FontObject(o) => WeakObject::FontObject(FontObjectWeak(GcCell::downgrade(o.0))),
+            Self::LocalConnectionObject(o) => WeakObject::LocalConnectionObject(LocalConnectionObjectWeak(GcCell::downgrade(o.0))),
         }
     }
 }
@@ -1479,8 +1503,13 @@ pub enum WeakObject<'gc> {
     TextureObject(TextureObjectWeak<'gc>),
     Program3DObject(Program3DObjectWeak<'gc>),
     NetStreamObject(NetStreamObjectWeak<'gc>),
+    NetConnectionObject(NetConnectionObjectWeak<'gc>),
+    ResponderObject(ResponderObjectWeak<'gc>),
     ShaderDataObject(ShaderDataObjectWeak<'gc>),
     SocketObject(SocketObjectWeak<'gc>),
+    FileReferenceObject(FileReferenceObjectWeak<'gc>),
+    FontObject(FontObjectWeak<'gc>),
+    LocalConnectionObject(LocalConnectionObjectWeak<'gc>),
 }
 
 impl<'gc> WeakObject<'gc> {
@@ -1518,8 +1547,13 @@ impl<'gc> WeakObject<'gc> {
             Self::TextureObject(o) => TextureObject(o.0.upgrade(mc)?).into(),
             Self::Program3DObject(o) => Program3DObject(o.0.upgrade(mc)?).into(),
             Self::NetStreamObject(o) => NetStreamObject(o.0.upgrade(mc)?).into(),
+            Self::NetConnectionObject(o) => NetConnectionObject(o.0.upgrade(mc)?).into(),
+            Self::ResponderObject(o) => ResponderObject(o.0.upgrade(mc)?).into(),
             Self::ShaderDataObject(o) => ShaderDataObject(o.0.upgrade(mc)?).into(),
             Self::SocketObject(o) => SocketObject(o.0.upgrade(mc)?).into(),
+            Self::FileReferenceObject(o) => FileReferenceObject(o.0.upgrade(mc)?).into(),
+            Self::FontObject(o) => FontObject(o.0.upgrade(mc)?).into(),
+            Self::LocalConnectionObject(o) => LocalConnectionObject(o.0.upgrade(mc)?).into(),
         })
     }
 }

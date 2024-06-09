@@ -9,9 +9,6 @@ package flash.display {
     import flash.display.Stage;
     import flash.geom.Point;
     import flash.events.EventDispatcher;
-    
-    import __ruffle__.stub_getter;
-    import __ruffle__.stub_setter;
 
     [Ruffle(InstanceAllocator)]
     [Ruffle(NativeInstanceInit)]
@@ -53,7 +50,9 @@ package flash.display {
         public native function get y():Number;
         public native function set y(value:Number):void;
 
+        [API("662")]
         public native function get z():Number;
+        [API("662")]
         public native function set z(value:Number):void;
 
         public native function get rotation():Number;
@@ -70,14 +69,9 @@ package flash.display {
 
         public native function get scaleZ():Number;
         public native function set scaleZ(value:Number):void;
-        
-        public function get scale9Grid():Rectangle {
-            stub_getter("flash.display.DisplayObject", "scale9Grid");
-            return null;
-        }
-        public function set scale9Grid(value:Rectangle):void {
-            stub_setter("flash.display.DisplayObject", "scale9Grid");
-        }
+
+        public native function get scale9Grid():Rectangle;
+        public native function set scale9Grid(value:Rectangle):void;
 
         public native function get name():String;
         public native function set name(value:String):void;
@@ -90,6 +84,9 @@ package flash.display {
 
         public native function get visible():Boolean;
         public native function set visible(value:Boolean):void;
+
+        public native function get metaData():Object;
+        public native function set metaData(value:Object):void;
 
         public native function get mouseX():Number;
 

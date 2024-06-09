@@ -2,12 +2,14 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_2008;
-use crate::avm2::object::{Object, TObject};
+use crate::avm2::object::{Object, TObject, VectorObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::vector::VectorStorage;
 use crate::avm2::Error;
-use crate::avm2::{ArrayObject, ArrayStorage};
-use crate::display_object::{StageDisplayState, TDisplayObject};
+use crate::display_object::{
+    StageDisplayState, TDisplayObject, TDisplayObjectContainer, TInteractiveObject,
+};
 use crate::string::{AvmString, WString};
 use crate::{avm2_stub_getter, avm2_stub_setter};
 use swf::Color;
@@ -183,6 +185,7 @@ pub fn get_focus<'gc>(
         .context
         .focus_tracker
         .get()
+        .map(|o| o.as_displayobject())
         .and_then(|focus_dobj| focus_dobj.object2().as_object())
         .map(|o| o.into())
         .unwrap_or(Value::Null))
@@ -198,7 +201,7 @@ pub fn set_focus<'gc>(
     match args.try_get_object(activation, 0) {
         None => focus.set(None, &mut activation.context),
         Some(obj) => {
-            if let Some(dobj) = obj.as_display_object() {
+            if let Some(dobj) = obj.as_display_object().and_then(|o| o.as_interactive()) {
                 focus.set(Some(dobj), &mut activation.context);
             } else {
                 return Err("Cannot set focus to non-DisplayObject".into());
@@ -284,8 +287,6 @@ pub fn set_scale_mode<'gc>(
 }
 
 /// Implement `stageFocusRect`'s getter
-///
-/// This setting is currently ignored in Ruffle.
 pub fn get_stage_focus_rect<'gc>(
     _activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
@@ -299,8 +300,6 @@ pub fn get_stage_focus_rect<'gc>(
 }
 
 /// Implement `stageFocusRect`'s setter
-///
-/// This setting is currently ignored in Ruffle.
 pub fn set_stage_focus_rect<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
@@ -417,15 +416,17 @@ pub fn get_stage3ds<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(stage) = this.as_display_object().and_then(|this| this.as_stage()) {
-        let storage = ArrayStorage::from_storage(
+        let storage = VectorStorage::from_values(
             stage
                 .stage3ds()
                 .iter()
-                .map(|obj| Some(Value::Object(*obj)))
+                .map(|obj| Value::Object(*obj))
                 .collect(),
+            false,
+            Some(activation.avm2().classes().stage3d),
         );
-        let stage3ds_array = ArrayObject::from_storage(activation, storage)?;
-        return Ok(stage3ds_array.into());
+        let stage3ds = VectorObject::from_vector(storage, activation)?;
+        return Ok(stage3ds.into());
     }
     Ok(Value::Undefined)
 }
@@ -480,4 +481,26 @@ pub fn get_full_screen_width<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_getter!(activation, "flash.display.Stage", "fullScreenWidth");
     Ok(1024.into())
+}
+
+pub fn set_tab_children<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(stage) = this.as_display_object().and_then(|this| this.as_stage()) {
+        // TODO FP actually refers here to the original root,
+        //      even if it has been removed.
+        //      See the test tab_ordering_stage_tab_children_remove_root.
+        if let Some(root) = stage.root_clip() {
+            if let Some(root) = root.as_container() {
+                // Stage's tabChildren setter just propagates the value to the AVM2 root.
+                // It does not affect the value of tabChildren of the stage, which is always true.
+                let value = args.get_bool(0);
+                root.set_tab_children(&mut activation.context, value);
+            }
+        }
+    }
+
+    Ok(Value::Undefined)
 }

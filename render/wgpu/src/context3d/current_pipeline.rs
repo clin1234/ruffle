@@ -1,5 +1,5 @@
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use naga_agal::{Filter, SamplerOverride, Wrapping};
+use naga_agal::{Filter, SamplerConfig, Wrapping};
 use ruffle_render::backend::{
     Context3DTextureFilter, Context3DTriangleFace, Context3DVertexBufferFormat, Context3DWrapMode,
     Texture,
@@ -16,6 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
+use crate::bitmaps::WgpuSamplerConfig;
 use crate::context3d::shader_pair::ShaderCompileData;
 use crate::context3d::VertexBufferWrapper;
 use crate::descriptors::Descriptors;
@@ -31,17 +32,6 @@ const VERTEX_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
 const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
     AGAL_NUM_FRAGMENT_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
 
-pub(super) const SAMPLER_REPEAT_LINEAR: u32 = 2;
-pub(super) const SAMPLER_REPEAT_NEAREST: u32 = 3;
-pub(super) const SAMPLER_CLAMP_LINEAR: u32 = 4;
-pub(super) const SAMPLER_CLAMP_NEAREST: u32 = 5;
-pub(super) const SAMPLER_CLAMP_U_REPEAT_V_LINEAR: u32 = 6;
-pub(super) const SAMPLER_CLAMP_U_REPEAT_V_NEAREST: u32 = 7;
-pub(super) const SAMPLER_REPEAT_U_CLAMP_V_LINEAR: u32 = 8;
-pub(super) const SAMPLER_REPEAT_U_CLAMP_V_NEAREST: u32 = 9;
-
-pub(super) const TEXTURE_START_BIND_INDEX: u32 = 10;
-
 // The flash Context3D API is similar to OpenGL - it has many methods
 // which modify the current state (`setVertexBufferAt`, `setCulling`, etc.)
 // These methods can be called at any time.
@@ -49,7 +39,7 @@ pub(super) const TEXTURE_START_BIND_INDEX: u32 = 10;
 // In WGPU, this state is associated by a `RenderPipeline` object,
 // which needs to be rebuilt whenever the state changes.
 //
-// To match up these APIs, we store the current state in `CurentPipeline`.
+// To match up these APIs, we store the current state in `CurrentPipeline`.
 // Whenever a state-changing `Context3DCommand` is executed, we mark the `CurrentPipeline`
 // as dirty. When a `wgpu::RenderPipeline` is actually needed by `drawTriangles`,
 // we build a new `wgpu::RenderPipeline` from the `CurrentPipeline` state (if it's dirty).
@@ -84,7 +74,13 @@ pub struct CurrentPipeline {
 
     dirty: Cell<bool>,
 
-    sampler_override: [Option<SamplerOverride>; 8],
+    // Sampler configuration information for each texture slot.
+    // This is updated by `Context3D.setSamplerStateAt`, as well
+    // as in `Context3D.setProgram` (based on the sampling opcodes
+    // in the program). All texture slots have a sampler set by default
+    // (which allows rendering with an 'ignoresampler' tex opcode,
+    // and no calls to Context3D.setSamplerStateAt)
+    sampler_configs: [SamplerConfig; 8],
 }
 
 #[derive(Clone)]
@@ -159,12 +155,20 @@ impl CurrentPipeline {
 
             target_format: TextureFormat::Rgba8Unorm,
 
-            sampler_override: [None; 8],
+            sampler_configs: [SamplerConfig::default(); 8],
         }
     }
     pub fn set_shaders(&mut self, shaders: Option<Rc<ShaderPairAgal>>) {
         self.dirty.set(true);
         self.shaders = shaders;
+        if let Some(shaders) = &self.shaders {
+            for (i, sampler_config) in shaders.fragment_sampler_configs().iter().enumerate() {
+                // When we call `Context3D.setProgram`, sampler configs from the fragment shader override
+                // any previously set sampler configs (if 'ignoresampler' was set in the program, then the corresponding
+                // array entry will be `None`).
+                self.sampler_configs[i] = sampler_config.unwrap_or(self.sampler_configs[i]);
+            }
+        }
     }
 
     pub fn update_texture_at(&mut self, index: usize, texture: Option<BoundTextureData>) {
@@ -243,6 +247,62 @@ impl CurrentPipeline {
 
         let bind_group_label = create_debug_label!("Bind group");
 
+        let wgpu_samplers =
+            self.sampler_configs
+                .map(|sampler| match (sampler.wrapping, sampler.filter) {
+                    (Wrapping::Clamp, Filter::Linear) => &descriptors.bitmap_samplers.clamp_linear,
+                    (Wrapping::Clamp, Filter::Nearest) => {
+                        &descriptors.bitmap_samplers.clamp_nearest
+                    }
+                    (Wrapping::Repeat, Filter::Linear) => {
+                        &descriptors.bitmap_samplers.repeat_linear
+                    }
+                    (Wrapping::Repeat, Filter::Nearest) => {
+                        &descriptors.bitmap_samplers.repeat_nearest
+                    }
+                    (Wrapping::ClampURepeatV, Filter::Linear) => {
+                        &descriptors.bitmap_samplers.clamp_u_repeat_v_linear
+                    }
+                    (Wrapping::ClampURepeatV, Filter::Nearest) => {
+                        &descriptors.bitmap_samplers.clamp_u_repeat_v_nearest
+                    }
+                    (Wrapping::RepeatUClampV, Filter::Linear) => {
+                        &descriptors.bitmap_samplers.repeat_u_clamp_v_linear
+                    }
+                    (Wrapping::RepeatUClampV, Filter::Nearest) => {
+                        &descriptors.bitmap_samplers.repeat_u_clamp_v_nearest
+                    }
+                    (
+                        wrapping,
+                        Filter::Anisotropic2x
+                        | Filter::Anisotropic4x
+                        | Filter::Anisotropic8x
+                        | Filter::Anisotropic16x,
+                    ) => {
+                        &descriptors.bitmap_samplers.anisotropic[&WgpuSamplerConfig {
+                            anisotropy_clamp: match sampler.filter {
+                                Filter::Anisotropic2x => 2,
+                                Filter::Anisotropic4x => 4,
+                                Filter::Anisotropic8x => 8,
+                                Filter::Anisotropic16x => 16,
+                                _ => unreachable!(),
+                            },
+                            address_mode_u: match wrapping {
+                                Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
+                                Wrapping::Repeat => wgpu::AddressMode::Repeat,
+                                Wrapping::ClampURepeatV => wgpu::AddressMode::ClampToEdge,
+                                Wrapping::RepeatUClampV => wgpu::AddressMode::Repeat,
+                            },
+                            address_mode_v: match wrapping {
+                                Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
+                                Wrapping::Repeat => wgpu::AddressMode::Repeat,
+                                Wrapping::ClampURepeatV => wgpu::AddressMode::Repeat,
+                                Wrapping::RepeatUClampV => wgpu::AddressMode::ClampToEdge,
+                            },
+                        }]
+                    }
+                });
+
         let mut bind_group_entries = vec![
             BindGroupEntry {
                 binding: 0,
@@ -260,53 +320,17 @@ impl CurrentPipeline {
                     size: Some(NonZeroU64::new(FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE).unwrap()),
                 }),
             },
-            BindGroupEntry {
-                binding: SAMPLER_REPEAT_LINEAR,
-                resource: BindingResource::Sampler(&descriptors.bitmap_samplers.repeat_linear),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_REPEAT_NEAREST,
-                resource: BindingResource::Sampler(&descriptors.bitmap_samplers.repeat_nearest),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_CLAMP_LINEAR,
-                resource: BindingResource::Sampler(&descriptors.bitmap_samplers.clamp_linear),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_CLAMP_NEAREST,
-                resource: BindingResource::Sampler(&descriptors.bitmap_samplers.clamp_nearest),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_CLAMP_U_REPEAT_V_LINEAR,
-                resource: BindingResource::Sampler(
-                    &descriptors.bitmap_samplers.clamp_u_repeat_v_linear,
-                ),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_CLAMP_U_REPEAT_V_NEAREST,
-                resource: BindingResource::Sampler(
-                    &descriptors.bitmap_samplers.clamp_u_repeat_v_nearest,
-                ),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_REPEAT_U_CLAMP_V_LINEAR,
-                resource: BindingResource::Sampler(
-                    &descriptors.bitmap_samplers.repeat_u_clamp_v_linear,
-                ),
-            },
-            BindGroupEntry {
-                binding: SAMPLER_REPEAT_U_CLAMP_V_NEAREST,
-                resource: BindingResource::Sampler(
-                    &descriptors.bitmap_samplers.repeat_u_clamp_v_nearest,
-                ),
-            },
         ];
 
         for (i, bound_texture) in self.bound_textures.iter().enumerate() {
             if let Some(bound_texture) = bound_texture {
                 bind_group_entries.push(BindGroupEntry {
-                    binding: TEXTURE_START_BIND_INDEX + i as u32,
+                    binding: naga_agal::TEXTURE_START_BIND_INDEX + i as u32,
                     resource: BindingResource::TextureView(&bound_texture.view),
+                });
+                bind_group_entries.push(BindGroupEntry {
+                    binding: naga_agal::TEXTURE_SAMPLER_START_BIND_INDEX + i as u32,
+                    resource: BindingResource::Sampler(wgpu_samplers[i]),
                 });
             }
         }
@@ -325,7 +349,7 @@ impl CurrentPipeline {
             descriptors,
             ShaderCompileData {
                 vertex_attributes: agal_attributes,
-                sampler_overrides: self.sampler_override,
+                sampler_configs: self.sampler_configs,
                 bound_textures: self.bound_textures.clone(),
             },
         );
@@ -399,11 +423,25 @@ impl CurrentPipeline {
                     index_per_buffer.last_mut().unwrap()
                 };
 
-                // FIXME - assert that this matches up with the AS3-supplied offset
-                buffer_data.total_size += entry_size_bytes;
+                let offset_bytes = attr.offset_in_32bit_units * 4;
+
+                // ActionScript may call setVertexBufferAt with overlapping offsets, e.g.:
+
+                // ```
+                // setVertexBufferAt(0, buffer, 0, "float3"]
+                // setVertexBufferAt(1, buffer, 2, "float4"]
+                // setVertexBufferAt(2, buffer, 6, "float2"]
+                // ```
+                //
+                // To correctly compute the total size, we look at the furthest extent of any buffer
+                // (its offset plus its length), rather than simply adding up all of the lengths.
+                buffer_data.total_size = std::cmp::max(
+                    buffer_data.total_size,
+                    entry_size_bytes + offset_bytes as usize,
+                );
                 buffer_data.attrs.push(wgpu::VertexAttribute {
                     format,
-                    offset: attr.offset_in_32bit_units * 4,
+                    offset: offset_bytes,
                     shader_location: i as u32,
                 })
             }
@@ -470,6 +508,7 @@ impl CurrentPipeline {
                     module: &compiled_shaders.vertex_module,
                     entry_point: naga_agal::SHADER_ENTRY_POINT,
                     buffers: &wgpu_vertex_buffers,
+                    compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &compiled_shaders.fragment_module,
@@ -482,6 +521,7 @@ impl CurrentPipeline {
                         }),
                         write_mask: self.color_mask,
                     })],
+                    compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     // Stage3d appears to use clockwise winding:
@@ -524,7 +564,7 @@ impl CurrentPipeline {
         wrap: ruffle_render::backend::Context3DWrapMode,
         filter: ruffle_render::backend::Context3DTextureFilter,
     ) {
-        let sampler_override = SamplerOverride {
+        let sampler_config = SamplerConfig {
             wrapping: match wrap {
                 Context3DWrapMode::Clamp => Wrapping::Clamp,
                 Context3DWrapMode::Repeat => Wrapping::Repeat,
@@ -534,15 +574,16 @@ impl CurrentPipeline {
             filter: match filter {
                 Context3DTextureFilter::Linear => Filter::Linear,
                 Context3DTextureFilter::Nearest => Filter::Nearest,
-                _ => unimplemented!(),
+                Context3DTextureFilter::Anisotropic2X => Filter::Anisotropic2x,
+                Context3DTextureFilter::Anisotropic4X => Filter::Anisotropic4x,
+                Context3DTextureFilter::Anisotropic8X => Filter::Anisotropic8x,
+                Context3DTextureFilter::Anisotropic16X => Filter::Anisotropic16x,
             },
             // FIXME - implement this
             mipmap: naga_agal::Mipmap::Disable,
         };
-        if self.sampler_override[sampler] != Some(sampler_override) {
-            self.dirty.set(true);
-            self.sampler_override[sampler] = Some(sampler_override);
-        }
+        self.dirty.set(true);
+        self.sampler_configs[sampler] = sampler_config;
     }
 }
 

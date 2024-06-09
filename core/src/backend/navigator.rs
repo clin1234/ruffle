@@ -3,18 +3,34 @@
 use crate::loader::Error;
 use crate::socket::{ConnectionState, SocketAction, SocketHandle};
 use crate::string::WStr;
-use async_channel::Receiver;
+use async_channel::{Receiver, Sender};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Display;
+use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
 use url::{ParseError, Url};
+
+/// Attempt to convert a relative URL into an absolute URL, using the base URL
+/// if necessary.
+///
+/// If the relative URL is actually absolute, then the base will not be used.
+pub fn url_from_relative_url(base: &str, relative: &str) -> Result<Url, ParseError> {
+    let parsed = Url::parse(relative);
+    if let Err(ParseError::RelativeUrlWithoutBase) = parsed {
+        let base = Url::parse(base)?;
+        return base.join(relative);
+    }
+
+    parsed
+}
 
 /// Enumerates all possible navigation methods.
 #[derive(Copy, Clone)]
@@ -172,18 +188,42 @@ impl Request {
 }
 
 /// A response to a successful fetch request.
-pub struct SuccessResponse {
+pub trait SuccessResponse {
     /// The final URL obtained after any redirects.
-    pub url: String,
+    fn url(&self) -> Cow<str>;
 
-    /// The contents of the response body.
-    pub body: Vec<u8>,
+    /// Retrieve the contents of the response body.
+    ///
+    /// This method consumes the response.
+    fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error>;
 
     /// The status code of the response.
-    pub status: u16,
+    fn status(&self) -> u16;
 
-    /// The field to indicate if the request has been redirected.
-    pub redirected: bool,
+    /// Indicates if the request has been redirected.
+    fn redirected(&self) -> bool;
+
+    /// Read the next chunk of the response.
+    ///
+    /// Repeated calls to `next_chunk` yield further bytes of the response body.
+    /// A response that has no data or no more data to yield will instead
+    /// yield None.
+    ///
+    /// The size of yielded chunks is implementation-defined.
+    ///
+    /// Mixing `next_chunk` and `body` is not supported and may yield errors.
+    /// Use one or the other.
+    fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error>;
+
+    /// Estimate the expected length of the response body.
+    ///
+    /// Returned length may not correspond to the actual length of data
+    /// returned from `next_chunk` or `body`. A `None` indicates that the data
+    /// is of indefinite length as reported by the source of the response.
+    ///
+    /// An error may be returned if the source reported corrupted or invalid
+    /// length information.
+    fn expected_length(&self) -> Result<Option<u64>, Error>;
 }
 
 /// A response to a non-successful fetch request.
@@ -231,7 +271,7 @@ pub trait NavigatorBackend {
     );
 
     /// Fetch data and return it some time in the future.
-    fn fetch(&self, request: Request) -> OwnedFuture<SuccessResponse, ErrorResponse>;
+    fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>;
 
     /// Take a URL string and resolve it to the actual URL from which a file
     /// can be fetched. This includes handling of relative links and pre-processing.
@@ -388,8 +428,8 @@ impl NavigatorBackend for NullNavigatorBackend {
     ) {
     }
 
-    fn fetch(&self, request: Request) -> OwnedFuture<SuccessResponse, ErrorResponse> {
-        fetch_path(self, "NullNavigatorBackend", request.url())
+    fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        fetch_path(self, "NullNavigatorBackend", request.url(), None)
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
@@ -414,7 +454,7 @@ impl NavigatorBackend for NullNavigatorBackend {
         sender: Sender<SocketAction>,
     ) {
         sender
-            .send(SocketAction::Connect(handle, ConnectionState::Failed))
+            .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
             .expect("working channel send");
     }
 }
@@ -435,7 +475,7 @@ pub fn async_return<SuccessType: 'static, ErrorType: 'static>(
 pub fn create_fetch_error<ErrorType: Display>(
     url: &str,
     error: ErrorType,
-) -> Result<SuccessResponse, ErrorResponse> {
+) -> Result<Box<dyn SuccessResponse>, ErrorResponse> {
     create_specific_fetch_error("Invalid URL", url, error)
 }
 
@@ -445,7 +485,7 @@ pub fn create_specific_fetch_error<ErrorType: Display>(
     reason: &str,
     url: &str,
     error: ErrorType,
-) -> Result<SuccessResponse, ErrorResponse> {
+) -> Result<Box<dyn SuccessResponse>, ErrorResponse> {
     let message = if error.to_string() == "" {
         format!("{reason} {url}")
     } else {
@@ -519,8 +559,7 @@ pub fn resolve_url_with_relative_base_path<NavigatorType: NavigatorBackend>(
     }
 }
 
-/// This is the fetch implementation for the TestNavigatorBackend and the
-/// NullNavigatorBackend.
+/// This is the fetch implementation for NullNavigatorBackend.
 ///
 /// It tries to fetch the given URL as a local path and read and return
 /// its content. It returns an ErrorResponse if the URL is not valid, not
@@ -529,7 +568,69 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
     navigator: &NavigatorType,
     navigator_name: &str,
     url: &str,
-) -> OwnedFuture<SuccessResponse, ErrorResponse> {
+    base_path: Option<&Path>,
+) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+    struct LocalResponse {
+        url: String,
+        path: PathBuf,
+        open_file: Option<File>,
+        status: u16,
+        redirected: bool,
+    }
+
+    impl SuccessResponse for LocalResponse {
+        fn url(&self) -> Cow<str> {
+            Cow::Borrowed(&self.url)
+        }
+
+        fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
+            Box::pin(async move {
+                std::fs::read(self.path).map_err(|e| Error::FetchError(e.to_string()))
+            })
+        }
+
+        fn status(&self) -> u16 {
+            self.status
+        }
+
+        fn redirected(&self) -> bool {
+            self.redirected
+        }
+
+        fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error> {
+            if self.open_file.is_none() {
+                let result = std::fs::File::open(self.path.clone())
+                    .map_err(|e| Error::FetchError(e.to_string()));
+
+                match result {
+                    Ok(file) => self.open_file = Some(file),
+                    Err(e) => return Box::pin(async move { Err(e) }),
+                }
+            }
+
+            let file = self.open_file.as_mut().unwrap();
+            let mut buf = vec![0; 4096];
+            let res = file.read(&mut buf);
+
+            Box::pin(async move {
+                match res {
+                    Ok(count) if count > 0 => {
+                        buf.resize(count, 0);
+                        Ok(Some(buf))
+                    }
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(Error::FetchError(e.to_string())),
+                }
+            })
+        }
+
+        fn expected_length(&self) -> Result<Option<u64>, Error> {
+            Ok(Some(
+                std::fs::File::open(self.path.clone())?.metadata()?.len(),
+            ))
+        }
+    }
+
     let url = match navigator.resolve_url(url) {
         Ok(url) => url,
         Err(e) => return async_return(create_fetch_error(url, e)),
@@ -551,6 +652,16 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
                 ))
             }
         }
+    } else if let Some(base_path) = base_path {
+        // Turn a url like https://localhost/foo/bar to {base_path}/localhost/foo/bar
+        let mut path = base_path.to_path_buf();
+        if let Some(host) = url.host_str() {
+            path.push(host);
+        }
+        if let Some(remaining) = url.path().strip_prefix('/') {
+            path.push(remaining);
+        }
+        path
     } else {
         return async_return(create_specific_fetch_error(
             &format!("{navigator_name} can't fetch non-local URL"),
@@ -560,15 +671,14 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
     };
 
     Box::pin(async move {
-        let body = match std::fs::read(path) {
-            Ok(body) => body,
-            Err(e) => return create_specific_fetch_error("Can't open file", url.as_str(), e),
-        };
-        Ok(SuccessResponse {
+        let response: Box<dyn SuccessResponse> = Box::new(LocalResponse {
             url: url.to_string(),
-            body,
+            path,
+            open_file: None,
             status: 0,
             redirected: false,
-        })
+        });
+
+        Ok(response)
     })
 }

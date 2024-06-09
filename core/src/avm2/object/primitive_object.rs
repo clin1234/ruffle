@@ -115,10 +115,6 @@ impl<'gc> TObject<'gc> for PrimitiveObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn to_string(&self, _activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(self.0.read().primitive)
-    }
-
     fn to_locale_string(
         &self,
         activation: &mut Activation<'_, 'gc>,
@@ -128,7 +124,7 @@ impl<'gc> TObject<'gc> for PrimitiveObject<'gc> {
             _ => {
                 let class_name = self
                     .instance_of_class_definition()
-                    .map(|c| c.read().name().local_name())
+                    .map(|c| c.name().local_name())
                     .unwrap_or_else(|| "Object".into());
 
                 Ok(AvmString::new_utf8(

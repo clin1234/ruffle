@@ -1,12 +1,11 @@
 //! `flash.utils` namespace
 
 use crate::avm2::object::TObject;
-
 use crate::avm2::{Activation, Error, Object, Value};
 use crate::string::AvmString;
 use crate::string::WString;
-use instant::Instant;
 use std::fmt::Write;
+use web_time::Instant;
 
 pub mod byte_array;
 pub mod dictionary;
@@ -209,7 +208,6 @@ pub fn get_qualified_class_name<'gc>(
 
     Ok(class
         .inner_class_definition()
-        .read()
         .name()
         .to_qualified_name(activation.context.gc_context)
         .into())
@@ -237,7 +235,6 @@ pub fn get_qualified_superclass_name<'gc>(
     if let Some(super_class) = class.superclass_object() {
         Ok(super_class
             .inner_class_definition()
-            .read()
             .name()
             .to_qualified_name(activation.context.gc_context)
             .into())

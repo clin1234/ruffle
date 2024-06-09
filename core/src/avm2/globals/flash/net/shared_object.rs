@@ -1,10 +1,13 @@
 //! `flash.net.SharedObject` builtin/prototype
 
+use crate::avm2::api_version::ApiVersion;
+use crate::avm2::error::error;
 use crate::avm2::object::TObject;
+use crate::avm2::Error::AvmError;
 use crate::avm2::Multiname;
 use crate::avm2::{Activation, Error, Namespace, Object, Value};
-use crate::avm2_stub_method;
 use crate::string::AvmString;
+use crate::{avm2_stub_getter, avm2_stub_method, avm2_stub_setter};
 use flash_lso::types::{AMFVersion, Lso};
 use std::borrow::Cow;
 
@@ -14,7 +17,14 @@ fn new_lso<'gc>(
     data: Object<'gc>,
 ) -> Result<Lso, Error<'gc>> {
     let mut elements = Vec::new();
-    crate::avm2::amf::recursive_serialize(activation, data, &mut elements, AMFVersion::AMF3)?;
+    crate::avm2::amf::recursive_serialize(
+        activation,
+        data,
+        &mut elements,
+        None,
+        AMFVersion::AMF3,
+        &mut Default::default(),
+    )?;
     Ok(Lso::new(
         elements,
         name.split('/')
@@ -145,7 +155,11 @@ pub fn get_local<'gc>(
 
     // Set the internal name
     let ruffle_name = Multiname::new(
-        Namespace::package("__ruffle__", &mut activation.borrow_gc()),
+        Namespace::package(
+            "__ruffle__",
+            ApiVersion::AllVersions,
+            &mut activation.borrow_gc(),
+        ),
         "_ruffleName",
     );
     this.set_property(
@@ -192,7 +206,11 @@ pub fn flush<'gc>(
         .coerce_to_object(activation)?;
 
     let ruffle_name = Multiname::new(
-        Namespace::package("__ruffle__", &mut activation.borrow_gc()),
+        Namespace::package(
+            "__ruffle__",
+            ApiVersion::AllVersions,
+            &mut activation.borrow_gc(),
+        ),
         "_ruffleName",
     );
     let name = this
@@ -203,11 +221,20 @@ pub fn flush<'gc>(
     let mut lso = new_lso(activation, &name, data)?;
     // Flash does not write empty LSOs to disk
     if lso.body.is_empty() {
-        Ok(true.into())
+        Ok("flushed".into())
     } else {
         let bytes = flash_lso::write::write_to_bytes(&mut lso).unwrap_or_default();
-        Ok(activation.context.storage.put(&name, &bytes).into())
+        if activation.context.storage.put(&name, &bytes) {
+            Ok("flushed".into())
+        } else {
+            Err(AvmError(error(
+                activation,
+                "Error #2130: Unable to flush SharedObject.",
+                2130,
+            )?))
+        }
     }
+    // FIXME - We should dispatch a NetStatusEvent after this function returns
 }
 
 pub fn get_size<'gc>(
@@ -220,7 +247,11 @@ pub fn get_size<'gc>(
         .coerce_to_object(activation)?;
 
     let ruffle_name = Multiname::new(
-        Namespace::package("__ruffle__", &mut activation.borrow_gc()),
+        Namespace::package(
+            "__ruffle__",
+            ApiVersion::AllVersions,
+            &mut activation.borrow_gc(),
+        ),
         "_ruffleName",
     );
     let name = this
@@ -263,7 +294,11 @@ pub fn clear<'gc>(
 
     // Delete data from storage backend.
     let ruffle_name = Multiname::new(
-        Namespace::package("__ruffle__", &mut activation.borrow_gc()),
+        Namespace::package(
+            "__ruffle__",
+            ApiVersion::AllVersions,
+            &mut activation.borrow_gc(),
+        ),
         "_ruffleName",
     );
     let name = this
@@ -272,5 +307,23 @@ pub fn clear<'gc>(
     let name = name.to_utf8_lossy();
     activation.context.storage.remove_key(&name);
 
+    Ok(Value::Undefined)
+}
+
+pub fn get_object_encoding<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    _this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_getter!(activation, "flash.net.SharedObject", "objectEncoding");
+    Ok(0.into())
+}
+
+pub fn set_object_encoding<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    _this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_setter!(activation, "flash.net.SharedObject", "objectEncoding");
     Ok(Value::Undefined)
 }

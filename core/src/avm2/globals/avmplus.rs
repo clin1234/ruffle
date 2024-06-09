@@ -4,7 +4,7 @@ use crate::avm2::method::Method;
 use crate::avm2::object::{ArrayObject, TObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::property::Property;
-use crate::avm2::ClassObject;
+use crate::avm2::{ClassObject, Namespace};
 
 use crate::avm2::{Activation, Error, Object, Value};
 use crate::avm2_stub_method;
@@ -15,9 +15,12 @@ pub fn describe_type_json<'gc>(
     _this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let value = args[0].coerce_to_object(activation)?;
     let flags = DescribeTypeFlags::from_bits(args.get_u32(activation, 1)?).expect("Invalid flags!");
+    if args[0] == Value::Null {
+        return describe_type_json_null(activation, flags);
+    }
 
+    let value = args[0].coerce_to_object(activation)?;
     let class_obj = value.as_class_object().or_else(|| value.instance_of());
     let object = activation
         .avm2()
@@ -34,7 +37,6 @@ pub fn describe_type_json<'gc>(
     }
 
     let class = class_obj.inner_class_definition();
-    let class = class.read();
 
     let qualified_name = class
         .name()
@@ -79,6 +81,102 @@ bitflags::bitflags! {
         const USE_ITRAITS             = 1 << 9;
         const HIDE_OBJECT             = 1 << 10;
     }
+}
+
+fn describe_type_json_null<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    flags: DescribeTypeFlags,
+) -> Result<Value<'gc>, Error<'gc>> {
+    if flags.contains(DescribeTypeFlags::USE_ITRAITS) {
+        return Ok(Value::Null);
+    }
+    let object = activation
+        .avm2()
+        .classes()
+        .object
+        .construct(activation, &[])?;
+
+    object.set_public_property("name", "null".into(), activation)?;
+    object.set_public_property("isDynamic", false.into(), activation)?;
+    object.set_public_property("isFinal", true.into(), activation)?;
+    object.set_public_property("isStatic", false.into(), activation)?;
+
+    let traits = activation
+        .avm2()
+        .classes()
+        .object
+        .construct(activation, &[])?;
+
+    if flags.contains(DescribeTypeFlags::INCLUDE_TRAITS) {
+        traits.set_public_property(
+            "bases",
+            if flags.contains(DescribeTypeFlags::INCLUDE_BASES) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "interfaces",
+            if flags.contains(DescribeTypeFlags::INCLUDE_INTERFACES) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "variables",
+            if flags.contains(DescribeTypeFlags::INCLUDE_VARIABLES) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "accessors",
+            if flags.contains(DescribeTypeFlags::INCLUDE_ACCESSORS) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "methods",
+            if flags.contains(DescribeTypeFlags::INCLUDE_METHODS) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "metadata",
+            if flags.contains(DescribeTypeFlags::INCLUDE_METADATA) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        traits.set_public_property(
+            "constructor",
+            if flags.contains(DescribeTypeFlags::INCLUDE_CONSTRUCTOR) {
+                ArrayObject::empty(activation)?.into()
+            } else {
+                Value::Null
+            },
+            activation,
+        )?;
+        object.set_public_property("traits", traits.into(), activation)?;
+    } else {
+        object.set_public_property("traits", Value::Null, activation)?;
+    }
+
+    Ok(object.into())
 }
 
 fn describe_internal_body<'gc>(
@@ -160,7 +258,6 @@ fn describe_internal_body<'gc>(
         while let Some(super_obj) = current_super_obj {
             let super_name = super_obj
                 .inner_class_definition()
-                .read()
                 .name()
                 .to_qualified_name(activation.context.gc_context);
             bases_array.push(super_name.into());
@@ -184,7 +281,6 @@ fn describe_internal_body<'gc>(
     if flags.contains(DescribeTypeFlags::INCLUDE_INTERFACES) && use_instance_traits {
         for interface in class_obj.interfaces() {
             let interface_name = interface
-                .read()
                 .name()
                 .to_qualified_name(activation.context.gc_context);
             interfaces_array.push(interface_name.into());
@@ -193,32 +289,21 @@ fn describe_internal_body<'gc>(
 
     // Implement the weird 'HIDE_NSURI_METHODS' behavior from avmplus:
     // https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/TypeDescriber.cpp#L237
-    let mut skip_ns = Vec::new();
+    let mut skip_ns: Vec<Namespace<'_>> = Vec::new();
     if let Some(super_vtable) = super_vtable {
         for (_, ns, prop) in super_vtable.resolved_traits().iter() {
             if !ns.as_uri().is_empty() {
-                if let Property::Method { disp_id } = prop {
-                    let method = super_vtable
-                        .get_full_method(*disp_id)
-                        .unwrap_or_else(|| panic!("Missing method for id {disp_id:?}"));
-                    let is_playerglobals = method
-                        .class
-                        .class_scope()
-                        .domain()
-                        .is_playerglobals_domain(activation);
-
-                    if !skip_ns.contains(&(ns, is_playerglobals)) {
-                        skip_ns.push((ns, is_playerglobals));
+                if let Property::Method { .. } = prop {
+                    if !skip_ns
+                        .iter()
+                        .any(|other_ns| other_ns.exact_version_match(ns))
+                    {
+                        skip_ns.push(ns);
                     }
                 }
             }
         }
     }
-
-    let class_is_playerglobals = class_obj
-        .class_scope()
-        .domain()
-        .is_playerglobals_domain(activation);
 
     // FIXME - avmplus iterates over their own hashtable, so the order in the final XML
     // is different
@@ -227,35 +312,10 @@ fn describe_internal_body<'gc>(
             continue;
         }
 
-        // Hack around our lack of namespace versioning.
-        // This is hack to work around the fact that we don't have namespace versioning
-        // Once we do, methods from playerglobals should end up distinct public and AS3
-        // namespaces, due to the special `kApiVersion_VM_ALLVERSIONS` used:
-        // https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/AbcParser.cpp#L1497
-        //
-        // The main way this is
-        // observable is by having a class like this:
-        //
-        // ``
-        // class SubClass extends SuperClass {
-        //   AS3 function subclassMethod {}
-        // }
-        // class SuperClass {}
-        // ```
-        //
-        // Here, `subclassMethod` will not get hidden - even though `Object`
-        // has AS3 methods, they are in the playerglobal AS3 namespace
-        // (with version kApiVersion_VM_ALLVERSIONS), which is distinct
-        // from the AS3 namespace used by SubClass. However, if we have any
-        // user-defined classes in the inheritance chain, then the namespace
-        // *should* match (if the swf version numbers match).
-        //
-        // For now, we approximate this by checking if the declaring class
-        // and our starting class are both in the playerglobals domain
-        // or both not in the playerglobals domain. If not, then we ignore
-        // `skip_ns`, since we should really have two different namespaces here.
         if flags.contains(DescribeTypeFlags::HIDE_NSURI_METHODS)
-            && skip_ns.contains(&(ns, class_is_playerglobals))
+            && skip_ns
+                .iter()
+                .any(|other_ns| ns.exact_version_match(*other_ns))
         {
             continue;
         }
@@ -323,14 +383,14 @@ fn describe_internal_body<'gc>(
                 let declared_by = method.class;
 
                 if flags.contains(DescribeTypeFlags::HIDE_OBJECT)
-                    && declared_by == activation.avm2().classes().object
+                    && declared_by == Some(activation.avm2().classes().object)
                 {
                     continue;
                 }
 
                 let declared_by_name = declared_by
+                    .unwrap()
                     .inner_class_definition()
-                    .read()
                     .name()
                     .to_qualified_name(activation.context.gc_context);
 
@@ -417,8 +477,8 @@ fn describe_internal_body<'gc>(
                 let accessor_type =
                     method_type.to_qualified_name_or_star(activation.context.gc_context);
                 let declared_by = defining_class
+                    .unwrap()
                     .inner_class_definition()
-                    .read()
                     .name()
                     .to_qualified_name(activation.context.gc_context);
 

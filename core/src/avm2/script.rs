@@ -1,13 +1,14 @@
 //! Whole script representation
 
-use super::traits::TraitKind;
+use super::api_version::ApiVersion;
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
 use crate::avm2::domain::Domain;
+use crate::avm2::globals::global_scope;
 use crate::avm2::method::{BytecodeMethod, Method};
-use crate::avm2::object::{Object, TObject};
+use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::scope::ScopeChain;
-use crate::avm2::traits::Trait;
+use crate::avm2::traits::{Trait, TraitKind};
 use crate::avm2::value::Value;
 use crate::avm2::Multiname;
 use crate::avm2::Namespace;
@@ -15,9 +16,10 @@ use crate::avm2::{Avm2, Error};
 use crate::context::{GcContext, UpdateContext};
 use crate::string::{AvmAtom, AvmString};
 use crate::tag_utils::SwfMovie;
+use crate::PlayerRuntime;
 use gc_arena::{Collect, Gc, GcCell, Mutation};
 use std::cell::Ref;
-use std::mem::drop;
+use std::fmt::Debug;
 use std::rc::Rc;
 use std::sync::Arc;
 use swf::avm2::types::{
@@ -55,7 +57,7 @@ struct TranslationUnitData<'gc> {
     abc: Rc<AbcFile>,
 
     /// All classes loaded from the ABC's class list.
-    classes: Vec<Option<GcCell<'gc, Class<'gc>>>>,
+    classes: Vec<Option<Class<'gc>>>,
 
     /// All methods loaded from the ABC's method list.
     methods: Vec<Option<Method<'gc>>>,
@@ -113,6 +115,24 @@ impl<'gc> TranslationUnit<'gc> {
         ))
     }
 
+    pub fn load_classes(self, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
+        // Classes must be loaded in the order they appear in the constant pool,
+        // to ensure that superclasses are loaded before subclasses
+
+        let num_classes = self.0.read().classes.len();
+        for i in 0..num_classes {
+            let class = self.load_class(i as u32, activation)?;
+
+            // NOTE: There are subtle differences between how a class is initially exported (here),
+            // and how it's exported again when it is encountered in a trait (see `Script::load_traits`).
+            // We currently don't handle them and just export it in the domain in both cases.
+            self.domain()
+                .export_class(class.name(), class, activation.context.gc_context);
+        }
+
+        Ok(())
+    }
+
     pub fn domain(self) -> Domain<'gc> {
         self.0.read().domain
     }
@@ -131,6 +151,18 @@ impl<'gc> TranslationUnit<'gc> {
         self.0.read().movie.clone()
     }
 
+    pub fn api_version(self, avm2: &Avm2<'gc>) -> ApiVersion {
+        if self.domain().is_playerglobals_domain(avm2) {
+            // FIXME: get this from the player version we're emulating
+            match avm2.player_runtime {
+                PlayerRuntime::FlashPlayer => ApiVersion::SWF_31,
+                PlayerRuntime::AIR => ApiVersion::AIR_20_0,
+            }
+        } else {
+            avm2.root_api_version
+        }
+    }
+
     /// Load a method from the ABC file and return its method definition.
     pub fn load_method(
         self,
@@ -143,7 +175,7 @@ impl<'gc> TranslationUnit<'gc> {
             return Ok(*method);
         }
 
-        let is_global = read.domain.is_playerglobals_domain(activation);
+        let is_global = read.domain.is_playerglobals_domain(activation.avm2());
         drop(read);
 
         let bc_method =
@@ -185,7 +217,7 @@ impl<'gc> TranslationUnit<'gc> {
         self,
         class_index: u32,
         activation: &mut Activation<'_, 'gc>,
-    ) -> Result<GcCell<'gc, Class<'gc>>, Error<'gc>> {
+    ) -> Result<Class<'gc>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(class)) = read.classes.get(class_index as usize) {
             return Ok(*class);
@@ -196,9 +228,8 @@ impl<'gc> TranslationUnit<'gc> {
         let class = Class::from_abc_index(self, class_index, activation)?;
         self.0.write(activation.context.gc_context).classes[class_index as usize] = Some(class);
 
-        class
-            .write(activation.context.gc_context)
-            .load_traits(self, class_index, activation)?;
+        class.load_traits(activation, self, class_index)?;
+        class.init_vtable(&mut activation.context)?;
 
         Ok(class)
     }
@@ -207,7 +238,7 @@ impl<'gc> TranslationUnit<'gc> {
     pub fn load_script(
         self,
         script_index: u32,
-        uc: &mut UpdateContext<'_, 'gc>,
+        activation: &mut Activation<'_, 'gc>,
     ) -> Result<Script<'gc>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(scripts)) = read.scripts.get(script_index as usize) {
@@ -218,16 +249,27 @@ impl<'gc> TranslationUnit<'gc> {
 
         drop(read);
 
-        let mut activation = Activation::from_domain(uc.reborrow(), domain);
-        let global_class = activation.avm2().classes().global;
-        let global_obj = global_class.construct(&mut activation, &[])?;
-        global_obj.fork_vtable(activation.context.gc_context);
+        let object_class = activation.avm2().classes().object;
 
-        let mut script =
-            Script::from_abc_index(self, script_index, global_obj, domain, &mut activation)?;
+        let global_classdef =
+            global_scope::create_class(activation, object_class.inner_class_definition());
+
+        let global_class =
+            ClassObject::from_class(activation, global_classdef, Some(object_class))?;
+
+        let global_obj = global_class.construct(activation, &[])?;
+
+        let script = Script::from_abc_index(
+            self,
+            script_index,
+            global_obj,
+            global_classdef,
+            domain,
+            activation,
+        )?;
         self.0.write(activation.context.gc_context).scripts[script_index as usize] = Some(script);
 
-        script.load_traits(self, script_index, &mut activation)?;
+        script.load_traits(self, script_index, activation)?;
 
         Ok(script)
     }
@@ -272,7 +314,7 @@ impl<'gc> TranslationUnit<'gc> {
         }
 
         let raw = if string_index == 0 {
-            ""
+            &[]
         } else {
             write
                 .abc
@@ -280,11 +322,12 @@ impl<'gc> TranslationUnit<'gc> {
                 .strings
                 .get(string_index as usize - 1)
                 .ok_or_else(|| format!("Unknown string constant {string_index}"))?
+                .as_slice()
         };
 
         let atom = context
             .interner
-            .intern_wstr(context.gc_context, ruffle_wstr::from_utf8(raw));
+            .intern_wstr(context.gc_context, ruffle_wstr::from_utf8_bytes(raw));
 
         write.strings[string_index as usize] = Some(atom);
         Ok(atom)
@@ -297,7 +340,7 @@ impl<'gc> TranslationUnit<'gc> {
     pub fn pool_namespace(
         self,
         ns_index: Index<AbcNamespace>,
-        context: &mut GcContext<'_, 'gc>,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<Namespace<'gc>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(namespace)) = read.namespaces.get(ns_index.0 as usize) {
@@ -317,7 +360,7 @@ impl<'gc> TranslationUnit<'gc> {
     pub fn pool_maybe_uninitialized_multiname(
         self,
         multiname_index: Index<AbcMultiname>,
-        context: &mut GcContext<'_, 'gc>,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
         let mc = context.gc_context;
         let read = self.0.read();
@@ -341,7 +384,7 @@ impl<'gc> TranslationUnit<'gc> {
     pub fn pool_multiname_static(
         self,
         multiname_index: Index<AbcMultiname>,
-        context: &mut GcContext<'_, 'gc>,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
         let multiname = self.pool_maybe_uninitialized_multiname(multiname_index, context)?;
         if multiname.has_lazy_component() {
@@ -358,7 +401,7 @@ impl<'gc> TranslationUnit<'gc> {
     pub fn pool_multiname_static_any(
         self,
         multiname_index: Index<AbcMultiname>,
-        context: &mut GcContext<'_, 'gc>,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
         if multiname_index.0 == 0 {
             let mc = context.gc_context;
@@ -379,6 +422,9 @@ pub struct Script<'gc>(GcCell<'gc, ScriptData<'gc>>);
 pub struct ScriptData<'gc> {
     /// The global object for the script.
     globals: Object<'gc>,
+
+    /// The class of this script's global object.
+    global_class: Option<Class<'gc>>,
 
     /// The domain associated with this script.
     domain: Domain<'gc>,
@@ -415,6 +461,7 @@ impl<'gc> Script<'gc> {
             mc,
             ScriptData {
                 globals,
+                global_class: None,
                 domain,
                 init: Method::from_builtin(
                     |_, _, _| Ok(Value::Undefined),
@@ -442,6 +489,7 @@ impl<'gc> Script<'gc> {
         unit: TranslationUnit<'gc>,
         script_index: u32,
         globals: Object<'gc>,
+        global_class: Class<'gc>,
         domain: Domain<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Self, Error<'gc>> {
@@ -458,6 +506,7 @@ impl<'gc> Script<'gc> {
             activation.context.gc_context,
             ScriptData {
                 globals,
+                global_class: Some(global_class),
                 domain,
                 init,
                 traits: Vec::new(),
@@ -475,7 +524,7 @@ impl<'gc> Script<'gc> {
     /// or double-borrows. It should be done before the script is actually
     /// executed.
     pub fn load_traits(
-        &mut self,
+        self,
         unit: TranslationUnit<'gc>,
         script_index: u32,
         activation: &mut Activation<'_, 'gc>,
@@ -499,15 +548,25 @@ impl<'gc> Script<'gc> {
             let newtrait = Trait::from_abc_trait(unit, abc_trait, activation)?;
             write
                 .domain
-                .export_definition(newtrait.name(), *self, activation.context.gc_context);
+                .export_definition(newtrait.name(), self, activation.context.gc_context);
             if let TraitKind::Class { class, .. } = newtrait.kind() {
                 write
                     .domain
-                    .export_class(*class, activation.context.gc_context);
+                    .export_class(newtrait.name(), *class, activation.context.gc_context);
             }
 
-            write.traits.push(newtrait);
+            write.traits.push(newtrait.clone());
+            write
+                .global_class
+                .expect("Global class should be initialized")
+                .define_instance_trait(activation.context.gc_context, newtrait);
         }
+
+        drop(write);
+
+        self.global_class()
+            .mark_traits_loaded(activation.context.gc_context);
+        self.global_class().init_vtable(&mut activation.context)?;
 
         Ok(())
     }
@@ -526,14 +585,26 @@ impl<'gc> Script<'gc> {
         self.0.read().translation_unit
     }
 
+    pub fn traits_loaded(self) -> bool {
+        self.0.read().traits_loaded
+    }
+
+    pub fn global_class(self) -> Class<'gc> {
+        self.0
+            .read()
+            .global_class
+            .expect("Global class should be initialized if it is accessed")
+    }
+
+    pub fn set_global_class(self, mc: &Mutation<'gc>, global_class: Class<'gc>) {
+        self.0.write(mc).global_class = Some(global_class);
+    }
+
     /// Return the global scope for the script.
     ///
     /// If the script has not yet been initialized, this will initialize it on
     /// the same stack.
-    pub fn globals(
-        &mut self,
-        context: &mut UpdateContext<'_, 'gc>,
-    ) -> Result<Object<'gc>, Error<'gc>> {
+    pub fn globals(self, context: &mut UpdateContext<'_, 'gc>) -> Result<Object<'gc>, Error<'gc>> {
         let mut write = self.0.write(context.gc_context);
 
         if !write.initialized {
@@ -548,15 +619,20 @@ impl<'gc> Script<'gc> {
             let scope = ScopeChain::new(domain);
 
             globals.vtable().unwrap().init_vtable(
-                globals.instance_of().unwrap(),
+                globals.instance_of(),
+                globals
+                    .instance_of()
+                    .unwrap()
+                    .inner_class_definition()
+                    .protected_namespace(),
                 &self.traits()?,
-                scope,
+                Some(scope),
                 None,
-                &mut null_activation,
-            )?;
+                &mut null_activation.context,
+            );
             globals.install_instance_slots(context.gc_context);
 
-            Avm2::run_script_initializer(*self, context)?;
+            Avm2::run_script_initializer(self, context)?;
 
             Ok(globals)
         } else {
@@ -576,5 +652,13 @@ impl<'gc> Script<'gc> {
         }
 
         Ok(Ref::map(read, |read| &read.traits[..]))
+    }
+}
+
+impl<'gc> Debug for Script<'gc> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("Script")
+            .field("ptr", &self.0.as_ptr())
+            .finish()
     }
 }

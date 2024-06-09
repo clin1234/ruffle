@@ -10,7 +10,7 @@ use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::QName;
 use bitflags::bitflags;
-use gc_arena::{Collect, GcCell};
+use gc_arena::Collect;
 use std::ops::Deref;
 use swf::avm2::types::{
     DefaultValue as AbcDefaultValue, Trait as AbcTrait, TraitKind as AbcTraitKind,
@@ -91,10 +91,7 @@ pub enum TraitKind<'gc> {
 
     /// A class property on an object that can be used to construct more
     /// objects.
-    Class {
-        slot_id: u32,
-        class: GcCell<'gc, Class<'gc>>,
-    },
+    Class { slot_id: u32, class: Class<'gc> },
 
     /// A free function (not an instance method) that can be called.
     Function { slot_id: u32, function: Method<'gc> },
@@ -110,8 +107,8 @@ pub enum TraitKind<'gc> {
 }
 
 impl<'gc> Trait<'gc> {
-    pub fn from_class(class: GcCell<'gc, Class<'gc>>) -> Self {
-        let name = class.read().name();
+    pub fn from_class(class: Class<'gc>) -> Self {
+        let name = class.name();
 
         Trait {
             name,
@@ -202,7 +199,7 @@ impl<'gc> Trait<'gc> {
         abc_trait: &AbcTrait,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Self, Error<'gc>> {
-        let name = QName::from_abc_multiname(unit, abc_trait.name, &mut activation.borrow_gc())?;
+        let name = QName::from_abc_multiname(unit, abc_trait.name, &mut activation.context)?;
 
         Ok(match &abc_trait.kind {
             AbcTraitKind::Slot {
@@ -211,7 +208,7 @@ impl<'gc> Trait<'gc> {
                 value,
             } => {
                 let type_name = unit
-                    .pool_multiname_static_any(*type_name, &mut activation.borrow_gc())?
+                    .pool_multiname_static_any(*type_name, &mut activation.context)?
                     .deref()
                     .clone();
                 let default_value = slot_default_value(unit, value, &type_name, activation)?;
@@ -278,7 +275,7 @@ impl<'gc> Trait<'gc> {
                 value,
             } => {
                 let type_name = unit
-                    .pool_multiname_static_any(*type_name, &mut activation.borrow_gc())?
+                    .pool_multiname_static_any(*type_name, &mut activation.context)?
                     .deref()
                     .clone();
                 let default_value = slot_default_value(unit, value, &type_name, activation)?;

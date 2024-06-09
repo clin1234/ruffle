@@ -19,7 +19,7 @@ pub struct ConstantPool {
     pub ints: Vec<i32>,
     pub uints: Vec<u32>,
     pub doubles: Vec<f64>,
-    pub strings: Vec<String>,
+    pub strings: Vec<Vec<u8>>,
     pub namespaces: Vec<Namespace>,
     pub namespace_sets: Vec<NamespaceSet>,
     pub multinames: Vec<Multiname>,
@@ -247,6 +247,12 @@ pub struct Script {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct LookupSwitch {
+    pub default_offset: i32,
+    pub case_offsets: Box<[i32]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Add,
     AddI,
@@ -269,7 +275,7 @@ pub enum Op {
         num_args: u32,
     },
     CallMethod {
-        index: Index<Method>,
+        index: u32,
         num_args: u32,
     },
     CallProperty {
@@ -471,10 +477,7 @@ pub enum Op {
     Li16,
     Li32,
     Li8,
-    LookupSwitch {
-        default_offset: i32,
-        case_offsets: Box<[i32]>,
-    },
+    LookupSwitch(Box<LookupSwitch>),
     LShift,
     Modulo,
     Multiply,
@@ -505,9 +508,6 @@ pub enum Op {
     PopScope,
     PushByte {
         value: u8,
-    },
-    PushConstant {
-        value: u32,
     },
     PushDouble {
         value: Index<f64>,

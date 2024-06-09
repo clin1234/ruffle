@@ -30,6 +30,12 @@ pub enum PlayerEvent {
     MouseWheel {
         delta: MouseWheelDelta,
     },
+    GamepadButtonDown {
+        button: GamepadButton,
+    },
+    GamepadButtonUp {
+        button: GamepadButton,
+    },
     TextInput {
         codepoint: char,
     },
@@ -337,18 +343,31 @@ impl<'gc> ClipEvent<'gc> {
 /// Control inputs to a text field
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize)]
 pub enum TextControlCode {
-    // TODO: Add control codes for Ctrl+Arrows and Home/End keys
     MoveLeft,
+    MoveLeftWord,
+    MoveLeftLine,
+    MoveLeftDocument,
     MoveRight,
+    MoveRightWord,
+    MoveRightLine,
+    MoveRightDocument,
     SelectLeft,
+    SelectLeftWord,
+    SelectLeftLine,
+    SelectLeftDocument,
     SelectRight,
+    SelectRightWord,
+    SelectRightLine,
+    SelectRightDocument,
     SelectAll,
     Copy,
     Paste,
     Cut,
     Backspace,
+    BackspaceWord,
     Enter,
     Delete,
+    DeleteWord,
 }
 
 impl TextControlCode {
@@ -356,12 +375,19 @@ impl TextControlCode {
     pub fn is_edit_input(self) -> bool {
         matches!(
             self,
-            Self::Paste | Self::Cut | Self::Backspace | Self::Enter | Self::Delete
+            Self::Paste
+                | Self::Cut
+                | Self::Enter
+                | Self::Backspace
+                | Self::BackspaceWord
+                | Self::Delete
+                | Self::DeleteWord
         )
     }
 }
 
 /// Flash virtual keycode.
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, FromPrimitive)]
 pub enum KeyCode {
     Unknown = 0,
@@ -457,6 +483,16 @@ pub enum KeyCode {
     F13 = 124,
     F14 = 125,
     F15 = 126,
+    F16 = 127, // undocumented
+    F17 = 128, // undocumented
+    F18 = 129, // undocumented
+    F19 = 130, // undocumented
+    F20 = 131, // undocumented
+    F21 = 132, // undocumented
+    F22 = 133, // undocumented
+    F23 = 134, // undocumented
+    F24 = 135, // undocumented
+    NumLock = 144,
     ScrollLock = 145,
     Semicolon = 186,
     Equals = 187,
@@ -502,7 +538,7 @@ impl From<MouseButton> for KeyCode {
 /// TODO: After 18, these are mostly ASCII... should we just use u8? How are different
 /// keyboard layouts/languages handled?
 /// SWF19 pp. 198-199
-#[derive(Debug, PartialEq, Eq, Copy, Clone, FromPrimitive)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, FromPrimitive, ToPrimitive)]
 pub enum ButtonKeyCode {
     Unknown = 0,
     Left = 1,
@@ -620,6 +656,10 @@ impl ButtonKeyCode {
     pub fn from_u8(n: u8) -> Option<Self> {
         num_traits::FromPrimitive::from_u8(n)
     }
+
+    pub fn to_u8(&self) -> u8 {
+        num_traits::ToPrimitive::to_u8(self).unwrap_or_default()
+    }
 }
 
 pub fn key_code_to_button_key_code(key_code: KeyCode) -> Option<ButtonKeyCode> {
@@ -641,4 +681,23 @@ pub fn key_code_to_button_key_code(key_code: KeyCode) -> Option<ButtonKeyCode> {
         _ => return None,
     };
     Some(out)
+}
+
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+pub enum GamepadButton {
+    South,
+    East,
+    North,
+    West,
+    LeftTrigger,
+    LeftTrigger2,
+    RightTrigger,
+    RightTrigger2,
+    Select,
+    Start,
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
 }

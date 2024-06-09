@@ -8,11 +8,9 @@ use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::object::{array_allocator, ArrayObject, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
-use crate::avm2::Multiname;
 use crate::avm2::QName;
 use crate::string::AvmString;
 use bitflags::bitflags;
-use gc_arena::GcCell;
 use std::cmp::{min, Ordering};
 use std::mem::swap;
 
@@ -87,12 +85,6 @@ pub fn instance_init<'gc>(
                         ),
                         1005,
                     )?));
-                }
-
-                // [NA] temporarily limit this. It may not be correct but it's better than 100GB arrays.
-                // TODO: sparse array support
-                if expected_len > (1 << 28) as f64 {
-                    return Err("Ruffle does not support sparse arrays yet.".into());
                 }
 
                 array.set_length(expected_len as usize);
@@ -1249,33 +1241,34 @@ pub fn remove_at<'gc>(
 }
 
 /// Construct `Array`'s class.
-pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> Class<'gc> {
     let mc = activation.context.gc_context;
     let class = Class::new(
-        QName::new(activation.avm2().public_namespace, "Array"),
-        Some(Multiname::new(activation.avm2().public_namespace, "Object")),
+        QName::new(activation.avm2().public_namespace_base_version, "Array"),
+        Some(activation.avm2().classes().object.inner_class_definition()),
         Method::from_builtin(instance_init, "<Array instance initializer>", mc),
         Method::from_builtin(class_init, "<Array class initializer>", mc),
         mc,
     );
 
-    let mut write = class.write(mc);
-
-    write.set_instance_allocator(array_allocator);
-    write.set_call_handler(Method::from_builtin(class_call, "<Array call handler>", mc));
+    class.set_instance_allocator(mc, array_allocator);
+    class.set_call_handler(
+        mc,
+        Method::from_builtin(class_call, "<Array call handler>", mc),
+    );
 
     const PUBLIC_INSTANCE_PROPERTIES: &[(
         &str,
         Option<NativeMethodImpl>,
         Option<NativeMethodImpl>,
     )] = &[("length", Some(length), Some(set_length))];
-    write.define_builtin_instance_properties(
+    class.define_builtin_instance_properties(
         mc,
-        activation.avm2().public_namespace,
+        activation.avm2().public_namespace_base_version,
         PUBLIC_INSTANCE_PROPERTIES,
     );
 
-    write.define_builtin_instance_methods(
+    class.define_builtin_instance_methods(
         mc,
         activation.avm2().as3_namespace,
         PUBLIC_AS3_INSTANCE_METHODS,
@@ -1294,18 +1287,23 @@ pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Cl
         ),
         ("UNIQUESORT", SortOptions::UNIQUE_SORT.bits() as u32),
     ];
-    write.define_constant_uint_class_traits(
-        activation.avm2().public_namespace,
+    class.define_constant_uint_class_traits(
+        activation.avm2().public_namespace_base_version,
         CONSTANTS_UINT,
         activation,
     );
 
     const CONSTANTS_INT: &[(&str, i32)] = &[("length", 1)];
-    write.define_constant_int_class_traits(
-        activation.avm2().public_namespace,
+    class.define_constant_int_class_traits(
+        activation.avm2().public_namespace_base_version,
         CONSTANTS_INT,
         activation,
     );
+
+    class.mark_traits_loaded(activation.context.gc_context);
+    class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
 
     class
 }

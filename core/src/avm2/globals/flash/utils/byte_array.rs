@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::avm2::activation::Activation;
 use crate::avm2::bytearray::{Endian, ObjectEncoding};
 use crate::avm2::error::make_error_2008;
@@ -11,6 +13,7 @@ use encoding_rs::UTF_8;
 use flash_lso::amf0::read::AMF0Decoder;
 use flash_lso::amf3::read::AMF3Decoder;
 use flash_lso::types::{AMFVersion, Element};
+use ruffle_wstr::WString;
 
 /// Writes a single byte to the bytearray
 pub fn write_byte<'gc>(
@@ -189,6 +192,28 @@ pub fn to_string<'gc>(
         let mut bytes = bytearray.bytes();
         if let Some(without_bom) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
             bytes = without_bom;
+        // Little-endian UTF-16 BOM
+        } else if let Some(without_bom) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+            let utf16_bytes: Vec<_> = without_bom
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            return Ok(AvmString::new(
+                activation.context.gc_context,
+                WString::from_buf(utf16_bytes),
+            )
+            .into());
+        // Big-endian UTF-16 BOM
+        } else if let Some(without_bom) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+            let utf16_bytes: Vec<_> = without_bom
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            return Ok(AvmString::new(
+                activation.context.gc_context,
+                WString::from_buf(utf16_bytes),
+            )
+            .into());
         }
         return Ok(AvmString::new_utf8_bytes(activation.context.gc_context, bytes).into());
     }
@@ -733,6 +758,7 @@ pub fn read_object<'gc>(
         let bytes = bytearray
             .read_at(bytearray.bytes_available(), bytearray.position())
             .map_err(|e| e.to_avm(activation))?;
+
         let (bytes_left, value) = match bytearray.object_encoding() {
             ObjectEncoding::Amf0 => {
                 let mut decoder = AMF0Decoder::default();
@@ -774,24 +800,31 @@ pub fn write_object<'gc>(
             ObjectEncoding::Amf0 => AMFVersion::AMF0,
             ObjectEncoding::Amf3 => AMFVersion::AMF3,
         };
-        if let Some(amf) = crate::avm2::amf::serialize_value(activation, obj, amf_version) {
-            let element = Element::new("", amf);
-            let mut lso = flash_lso::types::Lso::new(vec![element], "", amf_version);
-            let bytes = flash_lso::write::write_to_bytes(&mut lso)
-                .map_err(|_| "Failed to serialize object")?;
-            // This is kind of hacky: We need to strip out the header and any padding so that we only write
-            // the value. In the future, there should be a method to do this in the flash_lso crate.
-            let element_padding = match amf_version {
-                AMFVersion::AMF0 => 8,
-                AMFVersion::AMF3 => 7,
-            };
-            bytearray
-                .write_bytes(
-                    &bytes[flash_lso::write::header_length(&lso.header) + element_padding
-                        ..bytes.len() - 1],
-                )
-                .map_err(|e| e.to_avm(activation))?;
-        }
+
+        let amf = crate::avm2::amf::serialize_value(
+            activation,
+            obj,
+            amf_version,
+            &mut Default::default(),
+        )
+        .unwrap_or(flash_lso::types::Value::Undefined);
+
+        let element = Element::new("", Rc::new(amf));
+        let mut lso = flash_lso::types::Lso::new(vec![element], "", amf_version);
+        let bytes =
+            flash_lso::write::write_to_bytes(&mut lso).map_err(|_| "Failed to serialize object")?;
+        // This is kind of hacky: We need to strip out the header and any padding so that we only write
+        // the value. In the future, there should be a method to do this in the flash_lso crate.
+        let element_padding = match amf_version {
+            AMFVersion::AMF0 => 8,
+            AMFVersion::AMF3 => 7,
+        };
+        bytearray
+            .write_bytes(
+                &bytes[flash_lso::write::header_length(&lso.header) + element_padding
+                    ..bytes.len() - 1],
+            )
+            .map_err(|e| e.to_avm(activation))?;
     }
 
     Ok(Value::Undefined)

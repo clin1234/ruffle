@@ -8,7 +8,9 @@ use crate::avm1::scope::{Scope, ScopeClass};
 use crate::avm1::{fscommand, globals, scope, ArrayObject, ScriptObject, Value};
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, MovieClip, TDisplayObject, TDisplayObjectContainer};
+use crate::display_object::{
+    DisplayObject, DisplayObjectContainer, MovieClip, TDisplayObject, TDisplayObjectContainer,
+};
 use crate::ecma_conversions::{f64_to_wrapping_i32, f64_to_wrapping_u32};
 use crate::loader::MovieLoaderVMData;
 use crate::string::{AvmString, SwfStrExt as _, WStr, WString};
@@ -17,7 +19,6 @@ use crate::vminterface::Instantiator;
 use crate::{avm_error, avm_warn};
 use gc_arena::{Gc, GcCell, Mutation};
 use indexmap::IndexMap;
-use instant::Instant;
 use rand::Rng;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -26,6 +27,7 @@ use std::fmt;
 use swf::avm1::read::Reader;
 use swf::avm1::types::*;
 use url::form_urlencoded;
+use web_time::Instant;
 
 use super::object_reference::MovieClipReference;
 
@@ -234,7 +236,7 @@ impl Drop for Activation<'_, '_> {
 }
 
 impl<'a, 'gc> Activation<'a, 'gc> {
-    /// Convenience method to retrieve the current GC context. Note that explicitely writing
+    /// Convenience method to retrieve the current GC context. Note that explicitly writing
     /// `self.context.gc_context` can be sometimes necessary to satisfy the borrow checker.
     #[inline(always)]
     pub fn gc(&self) -> &'gc gc_arena::Mutation<'gc> {
@@ -2274,6 +2276,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     self.callee,
                 );
 
+                activation.local_registers = self.local_registers;
+
                 match catch_vars {
                     CatchVar::Var(name) => {
                         let name = AvmString::new(
@@ -2908,18 +2912,23 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
             level.set_depth(self.context.gc_context, level_id);
             level.set_default_root_name(&mut self.context);
-            self.context
-                .stage
-                .replace_at_depth(&mut self.context, level, level_id);
+            self.get_root_parent_container()
+                .and_then(|c| c.replace_at_depth(&mut self.context, level, level_id));
             level.post_instantiation(&mut self.context, None, Instantiator::Movie, false);
 
             level
         }
     }
 
+    /// Returns a reference to the DisplayObject that is the parent of the root.
+    pub fn get_root_parent_container(&self) -> Option<DisplayObjectContainer<'gc>> {
+        self.base_clip().avm1_stage().as_container()
+    }
+
     /// Tries to resolve a level by ID. Returns None if it does not exist.
     pub fn get_level(&mut self, level_id: i32) -> Option<DisplayObject<'gc>> {
-        self.context.stage.child_by_depth(level_id)
+        self.get_root_parent_container()
+            .and_then(|c| c.child_by_depth(level_id))
     }
 
     /// The current target clip of the executing code.
@@ -3104,7 +3113,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     /// Checks that the clip executing a script still exists.
-    /// If the clip executing a script is removed during exectuion, return from this activation.
+    /// If the clip executing a script is removed during execution, return from this activation.
     /// Should be called after any action that could potentially destroy a clip (gotos, etc.)
     fn continue_if_base_clip_exists(&self) -> Result<FrameControl<'gc>, Error<'gc>> {
         // The exception is `unload` clip event handlers, which currently are called when the clip

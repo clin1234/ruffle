@@ -108,7 +108,7 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
-                    if let Some(result) = read.array.get(index) {
+                    if let Some(result) = self.get_index_property(index) {
                         return Ok(result);
                     }
                 }
@@ -116,6 +116,10 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
         }
 
         read.base.get_property_local(name, activation)
+    }
+
+    fn get_index_property(self, index: usize) -> Option<Value<'gc>> {
+        self.0.read().array.get(index)
     }
 
     fn set_property_local(
@@ -129,11 +133,6 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
-                    // [NA] temporarily limit this. It may not be correct but it's better than 100GB arrays.
-                    // TODO: sparse array support
-                    if index > 1 << 28 {
-                        return Err("Ruffle does not support sparse arrays yet.".into());
-                    }
                     write.array.set(index, value);
                     return Ok(());
                 }
@@ -154,11 +153,6 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
-                    // [NA] temporarily limit this. It may not be correct but it's better than 100GB arrays.
-                    // TODO: sparse array support
-                    if index > 1 << 28 {
-                        return Err("Ruffle does not support sparse arrays yet.".into());
-                    }
                     write.array.set(index, value);
                     return Ok(());
                 }
@@ -207,25 +201,30 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
     fn get_next_enumerant(
         self,
         mut last_index: u32,
-        _activation: &mut Activation<'_, 'gc>,
+        activation: &mut Activation<'_, 'gc>,
     ) -> Result<Option<u32>, Error<'gc>> {
         let read = self.0.read();
-        let num_enumerants = read.base.num_enumerants();
         let array_length = read.array.length() as u32;
 
         // Array enumeration skips over holes.
-        while last_index < array_length {
-            if read.array.get(last_index as usize).is_some() {
-                return Ok(Some(last_index + 1));
-            }
-            last_index += 1;
+        if let Some(index) = read.array.get_next_enumerant(last_index as usize) {
+            return Ok(Some(index as u32));
         }
+
+        last_index = std::cmp::max(last_index, array_length);
+
+        drop(read);
 
         // After enumerating all of the 'normal' array entries,
         // we enumerate all of the local properties stored on the
         // ScriptObject.
-        if last_index < num_enumerants + array_length {
-            return Ok(Some(last_index + 1));
+        if let Some(index) = self
+            .0
+            .write(activation.context.gc_context)
+            .base
+            .get_next_enumerant(last_index - array_length)
+        {
+            return Ok(Some(index + array_length));
         }
         Ok(None)
     }
@@ -233,7 +232,7 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
     fn get_enumerant_name(
         self,
         index: u32,
-        _activation: &mut Activation<'_, 'gc>,
+        activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let arr_len = self.0.read().array.length() as u32;
         if arr_len >= index {
@@ -243,7 +242,7 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
                 .unwrap_or(Value::Undefined))
         } else {
             Ok(self
-                .base()
+                .base_mut(activation.context.gc_context)
                 .get_enumerant_name(index - arr_len)
                 .unwrap_or(Value::Undefined))
         }
@@ -254,10 +253,6 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
             .map(|index| index < self.0.read().array.length() as u32)
             .unwrap_or(false)
             || self.base().property_is_enumerable(name)
-    }
-
-    fn to_string(&self, _activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(Value::Object(Object::from(*self)))
     }
 
     fn value_of(&self, _mc: &Mutation<'gc>) -> Result<Value<'gc>, Error<'gc>> {

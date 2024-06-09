@@ -2,7 +2,7 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::domain::Domain;
-use crate::avm2::object::{Object, TObject};
+use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::avm2::{Multiname, Namespace};
@@ -72,6 +72,11 @@ impl<'gc> ScopeContainer<'gc> {
         self.scopes.get(index).cloned()
     }
 
+    /// Like `get`, but panics if the scope index is out of bounds.
+    pub fn get_unchecked(&self, index: usize) -> Scope<'gc> {
+        self.scopes[index]
+    }
+
     fn is_empty(&self) -> bool {
         self.scopes.is_empty()
     }
@@ -84,7 +89,7 @@ impl<'gc> ScopeContainer<'gc> {
 /// initial creation.
 ///
 /// A ScopeChain is either created by chaining new scopes on top of an already existing
-/// ScopeChain, or if we havn't created one yet (like during script initialization), you can
+/// ScopeChain, or if we haven't created one yet (like during script initialization), you can
 /// create an empty ScopeChain with only a Domain. A ScopeChain should **always** have a Domain.
 ///
 /// ScopeChain's are copy-on-write, meaning when we chain new scopes on top of a ScopeChain, we
@@ -147,6 +152,12 @@ impl<'gc> ScopeChain<'gc> {
         self.container.and_then(|container| container.get(index))
     }
 
+    /// Like `get`, but panics if the container doesn't exist or
+    /// the scope index is out of bounds.
+    pub fn get_unchecked(&self, index: usize) -> Scope<'gc> {
+        self.container.unwrap().get_unchecked(index)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.container
             .map(|container| container.is_empty())
@@ -184,7 +195,7 @@ impl<'gc> ScopeChain<'gc> {
             }
         }
         // That didn't work... let's try searching the domain now.
-        if let Some((qname, mut script)) = self.domain.get_defining_script(multiname)? {
+        if let Some((qname, script)) = self.domain.get_defining_script(multiname)? {
             return Ok(Some((
                 Some(qname.namespace()),
                 script.globals(&mut activation.context)?,
@@ -221,6 +232,30 @@ impl<'gc> ScopeChain<'gc> {
             }
         }
         Ok(found.map(|o| o.1))
+    }
+
+    pub fn get_entry_for_multiname(
+        &self,
+        multiname: &Multiname<'gc>,
+    ) -> Option<Option<(Option<ClassObject<'gc>>, u32)>> {
+        if let Some(container) = self.container {
+            for (index, scope) in container.scopes.iter().enumerate().skip(1).rev() {
+                if scope.with() {
+                    // If this is a `with` scope, stop here because
+                    // dynamic properties could be added at any time
+                    return Some(None);
+                }
+
+                let values = scope.values();
+                if values.has_trait(multiname) {
+                    return Some(Some((values.instance_of(), index as u32)));
+                }
+            }
+        }
+
+        // Nothing was found, and we can be sure that nothing will be
+        // found here at all (there were no `with` scopes).
+        None
     }
 
     pub fn resolve(

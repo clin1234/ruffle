@@ -2,7 +2,7 @@
 
 use crate::context::UpdateContext;
 use crate::drawing::Drawing;
-use crate::font::{EvalParameters, Font};
+use crate::font::{EvalParameters, Font, FontType};
 use crate::html::dimensions::{BoxBounds, Position, Size};
 use crate::html::text_format::{FormatSpans, TextFormat, TextSpan};
 use crate::string::{utils as string_utils, WStr};
@@ -249,7 +249,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         only_line: bool,
         final_line_of_para: bool,
         text: Option<(&'a WStr, usize, &TextSpan)>,
-        is_device_font: bool,
+        font_type: FontType,
     ) {
         if self.boxes.get_mut(self.current_line..).is_none() {
             return;
@@ -308,7 +308,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
             self.font_leading_adjustment()
         };
         if self.current_line_span.bullet && self.is_first_line && box_count > 0 {
-            self.append_bullet(context, &self.current_line_span.clone(), is_device_font);
+            self.append_bullet(context, &self.current_line_span.clone(), font_type);
         }
 
         box_count = 0;
@@ -366,15 +366,9 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         text: &'a WStr,
         end: usize,
         span: &TextSpan,
-        is_device_font: bool,
+        font_type: FontType,
     ) {
-        self.fixup_line(
-            context,
-            false,
-            true,
-            Some((text, end, span)),
-            is_device_font,
-        );
+        self.fixup_line(context, false, true, Some((text, end, span)), font_type);
 
         self.cursor.set_x(Twips::from_pixels(0.0));
         self.cursor += (
@@ -401,15 +395,9 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         text: &'a WStr,
         end: usize,
         span: &TextSpan,
-        is_device_font: bool,
+        font_type: FontType,
     ) {
-        self.fixup_line(
-            context,
-            false,
-            false,
-            Some((text, end, span)),
-            is_device_font,
-        );
+        self.fixup_line(context, false, false, Some((text, end, span)), font_type);
 
         self.cursor.set_x(Twips::from_pixels(0.0));
         self.cursor += (
@@ -432,7 +420,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
     /// tab index.
     fn tab(&mut self) {
         if self.current_line_span.tab_stops.is_empty() {
-            let modulo_factor = Twips::from_pixels(self.current_line_span.size * 2.7);
+            let modulo_factor = Twips::from_pixels(self.current_line_span.font.size * 2.7);
             let stop_modulo_tab =
                 ((self.cursor.x().get() / modulo_factor.get()) + 1) * modulo_factor.get();
             self.cursor.set_x(Twips::new(stop_modulo_tab));
@@ -451,9 +439,9 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
     fn newspan(&mut self, first_span: &TextSpan) {
         if self.is_start_of_line() {
             self.current_line_span = first_span.clone();
-            self.max_font_size = Twips::from_pixels(first_span.size);
+            self.max_font_size = Twips::from_pixels(first_span.font.size);
         } else {
-            self.max_font_size = max(self.max_font_size, Twips::from_pixels(first_span.size));
+            self.max_font_size = max(self.max_font_size, Twips::from_pixels(first_span.font.size));
         }
     }
 
@@ -461,16 +449,22 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         &mut self,
         context: &mut UpdateContext<'_, 'gc>,
         span: &TextSpan,
-        is_device_font: bool,
+        font_type: FontType,
     ) -> Option<Font<'gc>> {
-        let library = context.library.library_for_movie_mut(self.movie.clone());
-        let font_name = span.font.to_utf8_lossy();
+        let font_name = span.font.face.to_utf8_lossy();
 
         // Note that the SWF can still contain a DefineFont tag with no glyphs/layout info in this case (see #451).
         // In an ideal world, device fonts would search for a matching font on the system and render it in some way.
-        if !is_device_font {
-            if let Some(font) = library
-                .get_embedded_font_by_name(&font_name, span.bold, span.italic)
+        if font_type != FontType::Device {
+            if let Some(font) = context
+                .library
+                .get_embedded_font_by_name(
+                    &font_name,
+                    font_type,
+                    span.style.bold,
+                    span.style.italic,
+                    Some(self.movie.clone()),
+                )
                 .filter(|f| f.has_glyphs())
             {
                 return Some(font);
@@ -481,8 +475,34 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
             // return None;
         }
 
+        // Check if the font name is one of the known default fonts.
+        if let Some(default_font) = match font_name.deref() {
+            "_serif" => Some(DefaultFont::Serif),
+            "_sans" => Some(DefaultFont::Sans),
+            "_typewriter" => Some(DefaultFont::Typewriter),
+            "_ゴシック" => Some(DefaultFont::JapaneseGothic),
+            "_等幅" => Some(DefaultFont::JapaneseGothicMono),
+            "_明朝" => Some(DefaultFont::JapaneseMincho),
+            _ => None,
+        } {
+            return context
+                .library
+                .default_font(
+                    default_font,
+                    span.style.bold,
+                    span.style.italic,
+                    context.ui,
+                    context.renderer,
+                    context.gc_context,
+                )
+                .first()
+                .copied();
+        }
+
         if let Some(font) = context.library.get_or_load_device_font(
             &font_name,
+            span.style.bold,
+            span.style.italic,
             context.ui,
             context.renderer,
             context.gc_context,
@@ -490,19 +510,31 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
             return Some(font);
         }
 
-        // [NA] I suspect that there might be undocumented more aliases.
-        // I think I've seen translated versions of these used in the wild...
-        let default_font = match font_name.deref() {
-            "_serif" => DefaultFont::Serif,
-            "_typewriter" => DefaultFont::Typewriter,
-            _ => DefaultFont::Sans,
-        };
-
         // TODO: handle multiple fonts for a definition, each covering different sets of glyphs
+
+        // At this point, the font name was neither one of the default
+        // fonts nor matched any device font. We explicitly handle some of the
+        // well-known aliases for the default fonts for better compatibility
+        // with devices that don't have those fonts installed. As a last resort
+        // we fall back to using sans (like Flash).
+        let default_font = match font_name.deref() {
+            "Times New Roman" => DefaultFont::Serif,
+            "Arial" => DefaultFont::Sans,
+            "Courier New" => DefaultFont::Typewriter,
+            _ => {
+                if font_name.contains("Ming") || font_name.contains('明') {
+                    DefaultFont::JapaneseMincho
+                } else {
+                    DefaultFont::Sans
+                }
+            }
+        };
         context
             .library
             .default_font(
                 default_font,
+                span.style.bold,
+                span.style.italic,
                 context.ui,
                 context.renderer,
                 context.gc_context,
@@ -560,12 +592,9 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         &mut self,
         context: &mut UpdateContext<'_, 'gc>,
         span: &TextSpan,
-        is_device_font: bool,
+        font_type: FontType,
     ) {
-        if let Some(bullet_font) = self
-            .resolve_font(context, span, is_device_font)
-            .or(self.font)
-        {
+        if let Some(bullet_font) = self.resolve_font(context, span, font_type).or(self.font) {
             let mut bullet_cursor = self.cursor;
 
             bullet_cursor.set_x(
@@ -640,7 +669,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         mut self,
         context: &mut UpdateContext<'_, 'gc>,
         fs: &'a FormatSpans,
-        is_device_font: bool,
+        font_type: FontType,
     ) -> (Vec<LayoutBox<'gc>>, BoxBounds<Twips>) {
         self.fixup_line(
             context,
@@ -648,7 +677,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
             true,
             fs.last_span()
                 .map(|ls| (fs.displayed_text(), fs.displayed_text().len(), ls)),
-            is_device_font,
+            font_type,
         );
 
         (self.boxes, self.exterior_bounds.unwrap_or_default())
@@ -751,7 +780,7 @@ impl<'gc> LayoutBox<'gc> {
                 text_format: span.get_text_format(),
                 font,
                 params,
-                color: span.color,
+                color: span.font.color,
             },
         }
     }
@@ -766,7 +795,7 @@ impl<'gc> LayoutBox<'gc> {
                 text_format: span.get_text_format(),
                 font,
                 params,
-                color: span.color,
+                color: span.font.color,
             },
         }
     }
@@ -789,12 +818,12 @@ impl<'gc> LayoutBox<'gc> {
         movie: Arc<SwfMovie>,
         bounds: Twips,
         is_word_wrap: bool,
-        is_device_font: bool,
+        font_type: FontType,
     ) -> (Vec<LayoutBox<'gc>>, BoxBounds<Twips>) {
         let mut layout_context = LayoutContext::new(movie, bounds, fs.displayed_text());
 
         for (span_start, _end, span_text, span) in fs.iter_spans() {
-            if let Some(font) = layout_context.resolve_font(context, span, is_device_font) {
+            if let Some(font) = layout_context.resolve_font(context, span, font_type) {
                 layout_context.font = Some(font);
                 layout_context.newspan(span);
 
@@ -811,9 +840,13 @@ impl<'gc> LayoutBox<'gc> {
                     };
 
                     match delimiter {
-                        Some(b'\n' | b'\r') => {
-                            layout_context.explicit_newline(context, text, 0, span, is_device_font)
-                        }
+                        Some(b'\n' | b'\r') => layout_context.explicit_newline(
+                            context,
+                            fs.displayed_text(),
+                            span_start + slice_start - 1,
+                            span,
+                            font_type,
+                        ),
                         Some(b'\t') => layout_context.tab(),
                         _ => {}
                     }
@@ -849,10 +882,10 @@ impl<'gc> LayoutBox<'gc> {
                             } else if breakpoint == 0 {
                                 layout_context.newline(
                                     context,
-                                    text,
-                                    next_breakpoint,
+                                    fs.displayed_text(),
+                                    start + next_breakpoint,
                                     span,
-                                    is_device_font,
+                                    font_type,
                                 );
 
                                 let next_dim = layout_context.wrap_dimensions(span);
@@ -881,10 +914,10 @@ impl<'gc> LayoutBox<'gc> {
 
                             layout_context.newline(
                                 context,
-                                text,
-                                next_breakpoint,
+                                fs.displayed_text(),
+                                start + next_breakpoint,
                                 span,
-                                is_device_font,
+                                font_type,
                             );
                             let next_dim = layout_context.wrap_dimensions(span);
 
@@ -907,7 +940,7 @@ impl<'gc> LayoutBox<'gc> {
             }
         }
 
-        layout_context.end_layout(context, fs, is_device_font)
+        layout_context.end_layout(context, fs, font_type)
     }
 
     pub fn bounds(&self) -> BoxBounds<Twips> {

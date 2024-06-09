@@ -10,7 +10,9 @@ use crate::avm2::Multiname;
 use crate::avm2::Namespace;
 use crate::ecma_conversions::{f64_to_wrapping_i32, f64_to_wrapping_u32};
 use crate::string::{AvmAtom, AvmString, WStr};
-use gc_arena::{Collect, GcCell, Mutation};
+use gc_arena::{Collect, Mutation};
+use num_bigint::BigInt;
+use num_traits::{ToPrimitive, Zero};
 use std::cell::Ref;
 use std::mem::size_of;
 use swf::avm2::types::{DefaultValue as AbcDefaultValue, Index};
@@ -32,8 +34,6 @@ pub enum Hint {
 }
 
 /// An AVM2 value.
-///
-/// TODO: AVM2 also needs Scope, Namespace, and XML values.
 #[derive(Clone, Copy, Collect, Debug)]
 #[collect(no_drop)]
 pub enum Value<'gc> {
@@ -383,7 +383,7 @@ pub fn string_to_f64(mut s: &WStr, swf_version: u8, strict: bool) -> Option<f64>
     // Finally, calculate the result.
     let mut result = if total_digits > 15 {
         // With more than 15 digits, avmplus uses integer arithmetic to avoid rounding errors.
-        let mut result: i64 = 0;
+        let mut result: BigInt = Zero::zero();
         let mut decimal_digits = -1;
         for c in s {
             if let Some(digit) = to_decimal_digit(c) {
@@ -408,7 +408,7 @@ pub fn string_to_f64(mut s: &WStr, swf_version: u8, strict: bool) -> Option<f64>
             result *= i64::pow(10, exponent as u32);
         }
 
-        result as f64
+        result.to_f64().unwrap_or(f64::NAN)
     } else {
         let mut result = 0.0;
         let mut decimal_digits = -1;
@@ -535,7 +535,7 @@ pub fn abc_default_value<'gc>(
         | AbcDefaultValue::Explicit(ns)
         | AbcDefaultValue::StaticProtected(ns)
         | AbcDefaultValue::Private(ns) => {
-            let ns = translation_unit.pool_namespace(*ns, &mut activation.borrow_gc())?;
+            let ns = translation_unit.pool_namespace(*ns, &mut activation.context)?;
             NamespaceObject::from_namespace(activation, ns).map(Into::into)
         }
     }
@@ -755,7 +755,15 @@ impl<'gc> Value<'gc> {
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToUint32 algorithm which appears to match AVM2.
     pub fn coerce_to_u32(&self, activation: &mut Activation<'_, 'gc>) -> Result<u32, Error<'gc>> {
-        Ok(f64_to_wrapping_u32(self.coerce_to_number(activation)?))
+        Ok(match self {
+            Value::Integer(i) => *i as u32,
+            Value::Number(n) => f64_to_wrapping_u32(*n),
+            Value::Bool(b) => *b as u32,
+            Value::Undefined | Value::Null => 0,
+            Value::String(_) | Value::Object(_) => {
+                f64_to_wrapping_u32(self.coerce_to_number(activation)?)
+            }
+        })
     }
 
     /// Coerce the value to a 32-bit signed integer.
@@ -766,7 +774,15 @@ impl<'gc> Value<'gc> {
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToInt32 algorithm which appears to match AVM2.
     pub fn coerce_to_i32(&self, activation: &mut Activation<'_, 'gc>) -> Result<i32, Error<'gc>> {
-        Ok(f64_to_wrapping_i32(self.coerce_to_number(activation)?))
+        Ok(match self {
+            Value::Integer(i) => *i,
+            Value::Number(n) => f64_to_wrapping_i32(*n),
+            Value::Bool(b) => *b as i32,
+            Value::Undefined | Value::Null => 0,
+            Value::String(_) | Value::Object(_) => {
+                f64_to_wrapping_i32(self.coerce_to_number(activation)?)
+            }
+        })
     }
 
     /// Minimum number of digits after which numbers are formatted as
@@ -867,12 +883,8 @@ impl<'gc> Value<'gc> {
 
     /// Coerce the value to an Object.
     ///
-    /// TODO: In ECMA-262 3rd Edition, this would also box primitive values
-    /// into objects. Supposedly, ES4 removes primitive values entirely, and
-    /// the AVM2 Overview also implies that all this does is throw an error if
-    /// `undefined` or `null` are present. For the time being, this is what
-    /// that does. If we implement primitive boxing, then we should also box
-    /// them here, and this should change type to return `Object<'gc>`.
+    /// TODO: Once `PrimitiveObject` is removed, this method will be able
+    /// to be removed too, since all that this will do then is a null/undefined check.
     pub fn coerce_to_object(
         &self,
         activation: &mut Activation<'_, 'gc>,
@@ -971,30 +983,6 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    /// Like `coerce_to_type`, but also performs resolution of the type name.
-    /// This is used to allow coercing to a class while the ClassObject is still
-    /// being initialized. We should eventually be able to remove this, once
-    /// our Class/ClassObject representation is refactored.
-    pub fn coerce_to_type_name(
-        &self,
-        activation: &mut Activation<'_, 'gc>,
-        type_name: &Multiname<'gc>,
-    ) -> Result<Value<'gc>, Error<'gc>> {
-        if type_name.is_any_name() {
-            return Ok(*self);
-        }
-        let param_type = activation
-            .domain()
-            .get_class(type_name, activation.context.gc_context)?
-            .ok_or_else(|| {
-                Error::RustError(
-                    format!("Failed to lookup class {:?} during coercion", type_name).into(),
-                )
-            })?;
-
-        self.coerce_to_type(activation, param_type)
-    }
-
     /// Coerce the value to another value by type name.
     ///
     /// This function implements a handful of coercion rules that appear to be
@@ -1006,50 +994,32 @@ impl<'gc> Value<'gc> {
     pub fn coerce_to_type(
         &self,
         activation: &mut Activation<'_, 'gc>,
-        class: GcCell<'gc, Class<'gc>>,
+        class: Class<'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if GcCell::ptr_eq(
-            class,
-            activation.avm2().classes().int.inner_class_definition(),
-        ) {
+        if class == activation.avm2().classes().int.inner_class_definition() {
             return Ok(self.coerce_to_i32(activation)?.into());
         }
 
-        if GcCell::ptr_eq(
-            class,
-            activation.avm2().classes().uint.inner_class_definition(),
-        ) {
+        if class == activation.avm2().classes().uint.inner_class_definition() {
             return Ok(self.coerce_to_u32(activation)?.into());
         }
 
-        if GcCell::ptr_eq(
-            class,
-            activation.avm2().classes().number.inner_class_definition(),
-        ) {
+        if class == activation.avm2().classes().number.inner_class_definition() {
             return Ok(self.coerce_to_number(activation)?.into());
         }
 
-        if GcCell::ptr_eq(
-            class,
-            activation.avm2().classes().boolean.inner_class_definition(),
-        ) {
+        if class == activation.avm2().classes().boolean.inner_class_definition() {
             return Ok(self.coerce_to_boolean().into());
         }
 
         if matches!(self, Value::Undefined) || matches!(self, Value::Null) {
-            if GcCell::ptr_eq(
-                class,
-                activation.avm2().classes().void.inner_class_definition(),
-            ) {
+            if class == activation.avm2().classes().void.inner_class_definition() {
                 return Ok(Value::Undefined);
             }
             return Ok(Value::Null);
         }
 
-        if GcCell::ptr_eq(
-            class,
-            activation.avm2().classes().string.inner_class_definition(),
-        ) {
+        if class == activation.avm2().classes().string.inner_class_definition() {
             return Ok(self.coerce_to_string(activation)?.into());
         }
 
@@ -1060,7 +1030,6 @@ impl<'gc> Value<'gc> {
         }
 
         let name = class
-            .read()
             .name()
             .to_qualified_name_err_message(activation.context.gc_context);
 
@@ -1128,32 +1097,20 @@ impl<'gc> Value<'gc> {
     pub fn is_of_type(
         &self,
         activation: &mut Activation<'_, 'gc>,
-        type_object: GcCell<'gc, Class<'gc>>,
+        type_object: Class<'gc>,
     ) -> bool {
-        if GcCell::ptr_eq(
-            type_object,
-            activation.avm2().classes().number.inner_class_definition(),
-        ) {
+        if type_object == activation.avm2().classes().number.inner_class_definition() {
             return self.is_number();
         }
-        if GcCell::ptr_eq(
-            type_object,
-            activation.avm2().classes().uint.inner_class_definition(),
-        ) {
+        if type_object == activation.avm2().classes().uint.inner_class_definition() {
             return self.is_u32();
         }
-        if GcCell::ptr_eq(
-            type_object,
-            activation.avm2().classes().int.inner_class_definition(),
-        ) {
+        if type_object == activation.avm2().classes().int.inner_class_definition() {
             return self.is_i32();
         }
 
         if let Value::Undefined = self {
-            if GcCell::ptr_eq(
-                type_object,
-                activation.avm2().classes().void.inner_class_definition(),
-            ) {
+            if type_object == activation.avm2().classes().void.inner_class_definition() {
                 return true;
             }
         }
@@ -1194,7 +1151,6 @@ impl<'gc> Value<'gc> {
         // for XML and XMLList types. Because they are objects in Ruffle we
         // have to be a bit more complicated and factor out the code into
         // a separate method.
-        // TODO: QName and Namespace handling
         if let Value::Object(obj) = self {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(other, activation);
@@ -1202,6 +1158,15 @@ impl<'gc> Value<'gc> {
 
             if let Some(xml_obj) = obj.as_xml_object() {
                 return xml_obj.abstract_eq(other, activation);
+            }
+
+            if let Some(self_qname) = obj.as_qname_object() {
+                if let Value::Object(other_obj) = other {
+                    if let Some(other_qname) = other_obj.as_qname_object() {
+                        return Ok(self_qname.uri() == other_qname.uri()
+                            && self_qname.local_name() == other_qname.local_name());
+                    }
+                }
             }
 
             if let Some(self_ns) = obj.as_namespace_object() {
@@ -1297,20 +1262,38 @@ impl<'gc> Value<'gc> {
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Option<bool>, Error<'gc>> {
-        let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
-        let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Some(a < b)),
+            _ => {
+                let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
+                let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
 
-        if let (Value::String(s), Value::String(o)) = (&prim_self, &prim_other) {
-            return Ok(Some(s.to_string().bytes().lt(o.to_string().bytes())));
+                if let (Value::String(s), Value::String(o)) = (&prim_self, &prim_other) {
+                    return Ok(Some(s.to_string().bytes().lt(o.to_string().bytes())));
+                }
+
+                let num_self = prim_self.coerce_to_number(activation)?;
+                let num_other = prim_other.coerce_to_number(activation)?;
+
+                if num_self.is_nan() || num_other.is_nan() {
+                    return Ok(None);
+                }
+
+                Ok(Some(num_self < num_other))
+            }
         }
+    }
+}
 
-        let num_self = prim_self.coerce_to_number(activation)?;
-        let num_other = prim_other.coerce_to_number(activation)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        if num_self.is_nan() || num_other.is_nan() {
-            return Ok(None);
-        }
-
-        Ok(Some(num_self < num_other))
+    #[test]
+    fn test_string_to_f64() {
+        assert_eq!(
+            string_to_f64(WStr::from_units(b"350000000000000000000"), 0, true),
+            Some(3.5e20)
+        );
     }
 }

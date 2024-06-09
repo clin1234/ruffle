@@ -9,7 +9,9 @@ use crate::string::{AvmAtom, AvmStringRepr};
 #[derive(Clone, Copy, Collect)]
 #[collect(no_drop)]
 enum Source<'gc> {
-    Owned(Gc<'gc, AvmStringRepr>),
+    // TODO: Rename this to `Managed`, to avoid
+    // ambiguity with dependent/owned/owner terms.
+    Owned(Gc<'gc, AvmStringRepr<'gc>>),
     Static(&'static WStr),
 }
 
@@ -20,13 +22,28 @@ pub struct AvmString<'gc> {
 }
 
 impl<'gc> AvmString<'gc> {
-    pub(super) fn to_owned(self, gc_context: &Mutation<'gc>) -> Gc<'gc, AvmStringRepr> {
+    /// Turns a string to a fully owned (non-dependent) managed string.
+    pub(super) fn to_fully_owned(self, gc_context: &Mutation<'gc>) -> Gc<'gc, AvmStringRepr<'gc>> {
         match self.source {
-            Source::Owned(s) => s,
+            Source::Owned(s) => {
+                if s.is_dependent() {
+                    let repr = AvmStringRepr::from_raw(WString::from(self.as_wstr()), false);
+                    Gc::new(gc_context, repr)
+                } else {
+                    s
+                }
+            }
             Source::Static(s) => {
                 let repr = AvmStringRepr::from_raw(s.into(), false);
                 Gc::new(gc_context, repr)
             }
+        }
+    }
+
+    pub fn as_managed(self) -> Option<Gc<'gc, AvmStringRepr<'gc>>> {
+        match self.source {
+            Source::Owned(s) => Some(s),
+            Source::Static(_) => None,
         }
     }
 
@@ -50,6 +67,26 @@ impl<'gc> AvmString<'gc> {
         let repr = AvmStringRepr::from_raw(string.into(), false);
         Self {
             source: Source::Owned(Gc::new(gc_context, repr)),
+        }
+    }
+
+    pub fn new_dependent(
+        gc_context: &Mutation<'gc>,
+        string: AvmString<'gc>,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        // TODO?: if string is static, just make a new static AvmString
+        let repr = AvmStringRepr::new_dependent(string, start, end);
+        Self {
+            source: Source::Owned(Gc::new(gc_context, repr)),
+        }
+    }
+
+    pub fn owner(&self) -> Option<AvmString<'gc>> {
+        match &self.source {
+            Source::Owned(s) => s.owner(),
+            Source::Static(_) => None,
         }
     }
 
@@ -77,7 +114,28 @@ impl<'gc> AvmString<'gc> {
         } else if right.is_empty() {
             left
         } else {
-            let mut out = WString::from(left.as_wstr());
+            if let Some(repr) = AvmStringRepr::try_append_inline(left, &right) {
+                return Self {
+                    source: Source::Owned(Gc::new(gc_context, repr)),
+                };
+            }
+
+            // When doing a non-in-place append,
+            // Overallocate a bit so that further appends can be in-place.
+            // (Note that this means that all first-time appends will happen here and
+            // overallocate, even if done only once)
+            // This growth logic should be equivalent to AVM's, except I capped the growth at 1MB instead of 4MB.
+            let new_size = left.len() + right.len();
+            let new_capacity = if new_size < 32 {
+                32
+            } else if new_size > 1024 * 1024 {
+                new_size + 1024 * 1024
+            } else {
+                new_size * 2
+            };
+
+            let mut out = WString::with_capacity(new_capacity, left.is_wide() || right.is_wide());
+            out.push_str(&left);
             out.push_str(&right);
             Self::new(gc_context, out)
         }
@@ -94,6 +152,15 @@ impl<'gc> From<AvmAtom<'gc>> for AvmString<'gc> {
     fn from(atom: AvmAtom<'gc>) -> Self {
         Self {
             source: Source::Owned(atom.0),
+        }
+    }
+}
+
+impl<'gc> From<Gc<'gc, AvmStringRepr<'gc>>> for AvmString<'gc> {
+    #[inline]
+    fn from(repr: Gc<'gc, AvmStringRepr<'gc>>) -> Self {
+        Self {
+            source: Source::Owned(repr),
         }
     }
 }

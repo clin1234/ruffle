@@ -3,10 +3,12 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
+    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
 };
 use ruffle_render::bitmap::{
-    Bitmap, BitmapHandle, BitmapHandleImpl, BitmapSource, PixelRegion, PixelSnapping, SyncHandle,
+    Bitmap, BitmapHandle, BitmapHandleImpl, BitmapSource, PixelRegion, PixelSnapping, RgbaBufRead,
+    SyncHandle,
 };
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::error::Error;
@@ -36,7 +38,7 @@ pub struct WebCanvasRenderBackend {
     mask_state: MaskState,
     blend_modes: Vec<RenderBlendMode>,
 
-    // This is currnetly unused - we just store it to report
+    // This is currently unused - we just store it to report
     // in `get_viewport_dimensions`
     viewport_scale_factor: f64,
 }
@@ -491,7 +493,10 @@ impl RenderBackend for WebCanvasRenderBackend {
         Ok(())
     }
 
-    fn create_context3d(&mut self) -> Result<Box<dyn Context3D>, Error> {
+    fn create_context3d(
+        &mut self,
+        _profile: Context3DProfile,
+    ) -> Result<Box<dyn Context3D>, Error> {
         Err(Error::Unimplemented("createContext3D".into()))
     }
     fn context3d_present(&mut self, _context: &mut dyn Context3D) -> Result<(), Error> {
@@ -519,9 +524,17 @@ impl RenderBackend for WebCanvasRenderBackend {
         &mut self,
         _handle: ruffle_render::pixel_bender::PixelBenderShaderHandle,
         _arguments: &[ruffle_render::pixel_bender::PixelBenderShaderArgument],
-        _target: BitmapHandle,
-    ) -> Result<Box<dyn SyncHandle>, Error> {
+        _target: &PixelBenderTarget,
+    ) -> Result<PixelBenderOutput, Error> {
         Err(Error::Unimplemented("run_pixelbender_shader".into()))
+    }
+
+    fn resolve_sync_handle(
+        &mut self,
+        _handle: Box<dyn SyncHandle>,
+        _with_rgba: RgbaBufRead,
+    ) -> Result<(), Error> {
+        Err(Error::Unimplemented("Sync handle resolution".into()))
     }
 
     fn create_empty_texture(&mut self, width: u32, height: u32) -> Result<BitmapHandle, Error> {
@@ -1095,7 +1108,7 @@ fn swf_to_canvas_gradient(
 ) -> Result<Gradient, JsError> {
     let matrix = if transformed {
         // When we are rendering a complex gradient, the gradient transform is handled later by
-        // transforming the path before rendering; so use the indentity matrix here.
+        // transforming the path before rendering; so use the identity matrix here.
         swf::Matrix::scale(swf::Fixed16::from_f64(20.0), swf::Fixed16::from_f64(20.0))
     } else {
         swf_gradient.matrix

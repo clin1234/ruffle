@@ -5,6 +5,7 @@ use convert_case::{Boundary, Case, Casing};
 use proc_macro2::TokenStream;
 use quote::quote;
 use regex::RegexBuilder;
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
@@ -30,6 +31,9 @@ const METADATA_NATIVE_INSTANCE_INIT: &str = "NativeInstanceInit";
 /// Indicates that we should generate a reference to a class call handler
 /// method (used as a metadata key with `Ruffle` metadata)
 const METADATA_CALL_HANDLER: &str = "CallHandler";
+// The name for metadata for namespace versioning- the Flex SDK doesn't
+// strip versioning metadata, so we have to allow this metadata name
+const API_METADATA_NAME: &str = "API";
 
 /// If successful, returns a list of paths that were used. If this is run
 /// from a build script, these paths should be printed with
@@ -52,6 +56,10 @@ pub fn build_playerglobal(
             &asc_path.to_string_lossy(),
             "macromedia.asc.embedding.ScriptCompiler",
             "-optimize",
+            "-builtin",
+            "-apiversioning",
+            "-version",
+            "9",
             "-outdir",
             &out_dir.to_string_lossy(),
             "-out",
@@ -106,26 +114,62 @@ pub fn build_playerglobal(
 
 // Resolve the 'name' field of a `Multiname`. This only handles the cases
 // that we need for our custom `playerglobal.swf` (
-fn resolve_multiname_name<'a>(abc: &'a AbcFile, multiname: &Multiname) -> &'a str {
+fn resolve_multiname_name<'a>(abc: &'a AbcFile, multiname: &Multiname) -> Cow<'a, str> {
     if let Multiname::QName { name, .. } | Multiname::Multiname { name, .. } = multiname {
-        &abc.constant_pool.strings[name.0 as usize - 1]
+        String::from_utf8_lossy(&abc.constant_pool.strings[name.0 as usize - 1])
     } else {
         panic!("Unexpected Multiname {multiname:?}");
     }
 }
 
-// Like `resolve_multiname_name`, but for namespaces instead.
-fn resolve_multiname_ns<'a>(abc: &'a AbcFile, multiname: &Multiname) -> &'a str {
-    if let Multiname::QName { namespace, .. } = multiname {
-        let ns = &abc.constant_pool.namespaces[namespace.0 as usize - 1];
-        if let Namespace::Package(p) | Namespace::PackageInternal(p) = ns {
-            &abc.constant_pool.strings[p.0 as usize - 1]
-        } else {
-            panic!("Unexpected Namespace {ns:?}");
+// Strips off the version mark inserted by 'asc.jar',
+// giving us a valid Rust module name. The actual versioning logic
+// is handling in Ruffle when we load playerglobals
+fn strip_version_mark(val: Cow<'_, str>) -> Cow<'_, str> {
+    const MIN_API_MARK: usize = 0xE000;
+    const MAX_API_MARK: usize = 0xF8FF;
+
+    if let Some(chr) = val.chars().last() {
+        if chr as usize >= MIN_API_MARK && chr as usize <= MAX_API_MARK {
+            // The version mark is 3 bytes in utf-8
+            return val[..val.len() - 3].to_string().into();
         }
-    } else {
-        panic!("Unexpected Multiname {multiname:?}");
     }
+    val
+}
+
+// Like `resolve_multiname_name`, but for namespaces instead.
+fn resolve_multiname_ns<'a>(abc: &'a AbcFile, multiname: &Multiname) -> Cow<'a, str> {
+    let ns = match multiname {
+        Multiname::QName { namespace, .. } => {
+            &abc.constant_pool.namespaces[namespace.0 as usize - 1]
+        }
+        Multiname::Multiname { namespace_set, .. } => {
+            if namespace_set.0 == 0 {
+                panic!("Multiname namespace set must not be null");
+            }
+
+            let actual_index = namespace_set.0 as usize - 1;
+            let ns_set = abc
+                .constant_pool
+                .namespace_sets
+                .get(actual_index)
+                .unwrap_or_else(|| panic!("Unknown namespace set constant {}", actual_index));
+
+            if ns_set.len() == 1 {
+                &abc.constant_pool.namespaces[ns_set[0].0 as usize - 1]
+            } else {
+                panic!("Found multiple namespaces in namespace set {ns_set:?}")
+            }
+        }
+        _ => panic!("Unexpected Multiname {multiname:?}"),
+    };
+    let namespace = if let Namespace::Package(p) | Namespace::PackageInternal(p) = ns {
+        &abc.constant_pool.strings[p.0 as usize - 1]
+    } else {
+        panic!("Unexpected Namespace {ns:?}");
+    };
+    strip_version_mark(String::from_utf8_lossy(namespace))
 }
 
 fn flash_to_rust_path(path: &str) -> String {
@@ -179,7 +223,7 @@ fn rust_method_name_and_path(
         // For example, a namespace of "flash.system" and a name of "Security"
         // turns into the path "flash::system::security"
         let multiname = &abc.constant_pool.multinames[parent.0 as usize - 1];
-        let ns = flash_to_rust_path(resolve_multiname_ns(abc, multiname));
+        let ns = flash_to_rust_path(&resolve_multiname_ns(abc, multiname));
         if !ns.is_empty() {
             path += &ns;
             path += "::";
@@ -188,10 +232,10 @@ fn rust_method_name_and_path(
             flash_method_path += "::";
         }
         let name = resolve_multiname_name(abc, multiname);
-        path += &flash_to_rust_path(name);
+        path += &flash_to_rust_path(&name);
         path += "::";
 
-        flash_method_path += name;
+        flash_method_path += &*name;
         flash_method_path += "::";
     } else {
         // This is a freestanding function. Append its namespace (the package).
@@ -199,9 +243,9 @@ fn rust_method_name_and_path(
         // has a namespace of "flash.utils", which turns into the path
         // "flash::utils"
         let name = resolve_multiname_ns(abc, trait_name);
-        let ns = &flash_to_rust_path(name);
+        let ns = &flash_to_rust_path(&name);
         path += ns;
-        flash_method_path += name;
+        flash_method_path += &name;
         if !ns.is_empty() {
             path += "::";
             flash_method_path += "::";
@@ -212,10 +256,10 @@ fn rust_method_name_and_path(
     // name (e.g. `getDefinitionByName`)
     path += prefix;
 
-    let name = resolve_multiname_name(abc, trait_name);
+    let name = resolve_multiname_name(abc, trait_name).to_string();
 
-    path += &flash_to_rust_path(name);
-    flash_method_path += name;
+    path += &flash_to_rust_path(&name);
+    flash_method_path += &name;
 
     path += suffix;
 
@@ -254,7 +298,7 @@ fn strip_metadata(abc: &mut AbcFile) {
     }
 }
 
-/// Handles native functons defined in our `playerglobal`
+/// Handles native functions defined in our `playerglobal`
 ///
 /// The high-level idea is to generate code (specifically, a `TokenStream`)
 /// which builds a table - mapping from the method ids of native functions,
@@ -331,27 +375,31 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
         );
 
         let instance_allocator_method_name =
-            "::".to_string() + &flash_to_rust_path(class_name) + "_allocator";
+            "::".to_string() + &flash_to_rust_path(&class_name) + "_allocator";
         let native_instance_init_method_name = "::native_instance_init".to_string();
         let call_handler_method_name = "::call_handler".to_string();
         for metadata_idx in &trait_.metadata {
             let metadata = &abc.metadata[metadata_idx.0 as usize];
-            let name = &abc.constant_pool.strings[metadata.name.0 as usize - 1];
-            match name.as_str() {
-                RUFFLE_METADATA_NAME => {}
+            let name =
+                String::from_utf8_lossy(&abc.constant_pool.strings[metadata.name.0 as usize - 1]);
+
+            let is_versioning = match &*name {
+                RUFFLE_METADATA_NAME => false,
+                API_METADATA_NAME => true,
                 _ => panic!("Unexpected class metadata {name:?}"),
-            }
+            };
 
             for item in &metadata.items {
                 let key = if item.key.0 != 0 {
-                    Some(abc.constant_pool.strings[item.key.0 as usize - 1].as_str())
+                    Some(&abc.constant_pool.strings[item.key.0 as usize - 1])
                 } else {
                     None
                 };
-                let value = &abc.constant_pool.strings[item.value.0 as usize - 1];
-                match (key, value.as_str()) {
+                let value =
+                    String::from_utf8_lossy(&abc.constant_pool.strings[item.value.0 as usize - 1]);
+                match (key, &*value) {
                     // Match `[Ruffle(InstanceAllocator)]`
-                    (None, METADATA_INSTANCE_ALLOCATOR) => {
+                    (None, METADATA_INSTANCE_ALLOCATOR) if !is_versioning => {
                         // This results in a path of the form
                         // `crate::avm2::globals::<path::to::class>::<class_allocator>`
                         rust_instance_allocators[class_id as usize] = rust_method_name_and_path(
@@ -362,7 +410,7 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
                             &instance_allocator_method_name,
                         );
                     }
-                    (None, METADATA_NATIVE_INSTANCE_INIT) => {
+                    (None, METADATA_NATIVE_INSTANCE_INIT) if !is_versioning => {
                         rust_native_instance_initializers[class_id as usize] =
                             rust_method_name_and_path(
                                 &abc,
@@ -372,7 +420,7 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
                                 &native_instance_init_method_name,
                             )
                     }
-                    (None, METADATA_CALL_HANDLER) => {
+                    (None, METADATA_CALL_HANDLER) if !is_versioning => {
                         rust_call_handlers[class_id as usize] = rust_method_name_and_path(
                             &abc,
                             trait_,
@@ -381,6 +429,7 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
                             &call_handler_method_name,
                         )
                     }
+                    (None, _) if is_versioning => {}
                     _ => panic!("Unexpected metadata pair ({key:?}, {value})"),
                 }
             }
@@ -478,7 +527,7 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
 fn collect_stubs(root: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let pattern = RegexBuilder::new(
         r#"
-            \b (?P<type> stub_method | stub_getter | stub_setter | stub_constructor) \s* 
+            \b (?P<type> stub_method | stub_getter | stub_setter | stub_constructor) \s*
             \( \s*
                 "(?P<class> .+)" \s*
                 , \s*

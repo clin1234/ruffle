@@ -1,7 +1,7 @@
 //! Core event structure
 
 use crate::avm2::activation::Activation;
-use crate::avm2::error::type_error;
+use crate::avm2::error::make_error_2007;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
@@ -399,15 +399,19 @@ pub fn dispatch_event_to_target<'gc>(
     let name = evtmut.event_type();
     let use_capture = evtmut.phase() == EventPhase::Capturing;
 
-    evtmut.set_current_target(target);
-
-    drop(evtmut);
-
     let handlers: Vec<Object<'gc>> = dispatch_list
         .as_dispatch_mut(activation.context.gc_context)
         .ok_or_else(|| Error::from("Internal dispatch list is missing during dispatch!"))?
         .iter_event_handlers(name, use_capture)
         .collect();
+
+    evtmut.set_current_target(target);
+
+    if !handlers.is_empty() {
+        evtmut.dispatched = true;
+    }
+
+    drop(evtmut);
 
     for handler in handlers.iter() {
         if event
@@ -447,10 +451,16 @@ pub fn dispatch_event<'gc>(
         .unwrap_or(this);
 
     let mut ancestor_list = Vec::new();
-    let mut parent = parent_of(target);
-    while let Some(par) = parent {
-        ancestor_list.push(par);
-        parent = parent_of(par);
+    // Edge case - during button construction, we fire bubbling events for objects
+    // that are in the hierarchy (and have `DisplayObject.stage` return the actual stage),
+    // but do not yet have their *parent* object constructed. As a result, we walk through
+    // the parent DisplayObject hierarchy, only adding ancestors that have objects constructed.
+    let mut parent = target.as_display_object().and_then(|dobj| dobj.parent());
+    while let Some(parent_dobj) = parent {
+        if let Value::Object(parent_obj) = parent_dobj.object2() {
+            ancestor_list.push(parent_obj);
+        }
+        parent = parent_dobj.parent();
     }
 
     let dispatched = event.as_event().unwrap().dispatched;
@@ -459,18 +469,7 @@ pub fn dispatch_event<'gc>(
         event
             .call_public_property("clone", &[], activation)?
             .as_object()
-            .ok_or_else(|| {
-                let error = type_error(
-                    activation,
-                    "Error #2007: Parameter event must be non-null.",
-                    2007,
-                );
-
-                match error {
-                    Err(e) => e,
-                    Ok(e) => Error::AvmError(e),
-                }
-            })?
+            .ok_or_else(|| make_error_2007(activation, "event"))?
     } else {
         event
     };
@@ -479,7 +478,6 @@ pub fn dispatch_event<'gc>(
 
     evtmut.set_phase(EventPhase::Capturing);
     evtmut.set_target(target);
-    evtmut.dispatched = true;
 
     drop(evtmut);
 

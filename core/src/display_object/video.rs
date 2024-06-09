@@ -6,7 +6,7 @@ use crate::avm2::{
     Value as Avm2Value,
 };
 use crate::context::{RenderContext, UpdateContext};
-use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
+use crate::display_object::{DisplayObjectBase, DisplayObjectPtr};
 use crate::prelude::*;
 use crate::streams::NetStream;
 use crate::tag_utils::{SwfMovie, SwfSlice};
@@ -23,7 +23,7 @@ use std::borrow::BorrowMut;
 use std::cell::{Ref, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use swf::{CharacterId, DefineVideoStream, VideoCodec, VideoFrame};
+use swf::{DefineVideoStream, VideoCodec, VideoFrame};
 
 /// A Video display object is a high-level interface to a video player.
 ///
@@ -231,10 +231,6 @@ impl<'gc> Video<'gc> {
     /// `seek` is only called when processing `PlaceObject` tags involving this
     /// Video. It is a no-op for Videos that are connected to a `NetStream`.
     pub fn seek(self, context: &mut UpdateContext<'_, 'gc>, mut frame_id: u32) {
-        // Technically we might not need to invalidate...
-        // but if you're caching a video, this is the least of the efficiency concerns
-        self.invalidate_cached_bitmap(context.gc_context);
-
         let read = self.0.read();
         if let VideoStream::Uninstantiated(_) = &read.stream {
             drop(read);
@@ -342,7 +338,11 @@ impl<'gc> Video<'gc> {
         drop(read);
 
         match res {
-            Ok(bitmap) => self.0.write(context.gc_context).decoded_frame = Some((frame_id, bitmap)),
+            Ok(bitmap) => {
+                self.0.write(context.gc_context).decoded_frame = Some((frame_id, bitmap));
+                self.invalidate_cached_bitmap(context.gc_context);
+                *context.needs_render = true;
+            }
             Err(e) => tracing::error!("Got error when seeking to video frame {}: {}", frame_id, e),
         }
     }
@@ -376,7 +376,7 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
         _instantiated_by: Instantiator,
         run_frame: bool,
     ) {
-        if !context.is_action_script_3() {
+        if !self.movie().is_action_script_3() {
             context
                 .avm1
                 .add_to_exec_list(context.gc_context, (*self).into());
@@ -465,13 +465,13 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
 
         self.seek(context, starting_seek);
 
-        if !context.is_action_script_3() && run_frame {
+        if !self.movie().is_action_script_3() && run_frame {
             self.run_frame_avm1(context);
         }
     }
 
     fn construct_frame(&self, context: &mut UpdateContext<'_, 'gc>) {
-        if context.is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
+        if self.movie().is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
             let video_constr = context.avm2.classes().video;
             let mut activation = Avm2Activation::from_nothing(context.reborrow());
             let size = self.0.read().size;

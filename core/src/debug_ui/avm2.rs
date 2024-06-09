@@ -10,6 +10,8 @@ use fnv::FnvHashMap;
 use gc_arena::Mutation;
 use std::borrow::Cow;
 
+use super::movie::open_movie_button;
+
 #[derive(Debug, Eq, PartialEq, Hash, Default, Copy, Clone)]
 enum Panel {
     Information,
@@ -46,7 +48,7 @@ impl Avm2ObjectWindow {
         Window::new(object_name(activation.context.gc_context, object))
             .id(Id::new(object.as_ptr()))
             .open(&mut keep_open)
-            .scroll2([true, true])
+            .scroll([true, true])
             .show(egui_ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.open_panel, Panel::Information, "Information");
@@ -122,7 +124,9 @@ impl Avm2ObjectWindow {
                                 encoder.set_color(png::ColorType::Rgba);
                                 encoder.set_depth(png::BitDepth::Eight);
                                 if let Err(e) = encoder.write_header().and_then(|mut w| {
-                                    w.write_image_data(&bmd.sync().read().pixels_rgba())
+                                    w.write_image_data(
+                                        &bmd.sync(activation.context.renderer).read().pixels_rgba(),
+                                    )
                                 }) {
                                     tracing::error!("Couldn't create png: {e}");
                                 } else {
@@ -181,7 +185,7 @@ impl Avm2ObjectWindow {
             .spacing([8.0, 8.0])
             .show(ui, |ui| {
                 let definition = class.inner_class_definition();
-                let name = definition.read().name();
+                let name = definition.name();
 
                 ui.label("Namespace");
                 ui.text_edit_singleline(&mut name.namespace().as_uri().to_string().as_str());
@@ -190,6 +194,12 @@ impl Avm2ObjectWindow {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut name.local_name().to_string().as_str());
                 ui.end_row();
+
+                if let Some(tuint) = class.translation_unit() {
+                    ui.label("Movie");
+                    open_movie_button(ui, &tuint.movie(), messages);
+                    ui.end_row();
+                }
 
                 ui.label("Super Chain");
                 ui.vertical(|ui| {
@@ -206,7 +216,6 @@ impl Avm2ObjectWindow {
                     for interface in class.interfaces() {
                         ui.text_edit_singleline(
                             &mut interface
-                                .read()
                                 .name()
                                 .to_qualified_name_err_message(activation.context.gc_context)
                                 .to_string()
@@ -424,14 +433,13 @@ fn object_name<'gc>(mc: &Mutation<'gc>, object: Object<'gc>) -> String {
     if let Some(class) = object.as_class_object() {
         class
             .inner_class_definition()
-            .read()
             .name()
             .to_qualified_name_err_message(mc)
             .to_string()
     } else {
         let name = object
             .instance_of_class_definition()
-            .map(|r| Cow::Owned(r.read().name().local_name().to_string()))
+            .map(|r| Cow::Owned(r.name().local_name().to_string()))
             .unwrap_or(Cow::Borrowed("Object"));
         format!("{} {:p}", name, object.as_ptr())
     }

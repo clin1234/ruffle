@@ -1,11 +1,10 @@
-network-settings = Opções de Rede
+network-settings = Configurações de Rede
 player-settings = Opções do Leitor
 movie-parameters = Parâmetros de Filme
 custom-base-url = URL Base Personalizado
 spoof-swf-url = Disfarçar URL do SWF
 proxy = Proxy
 upgrade-http = Converter HTTP em HTTPS
-upgrade-http-check = Converter
 tcp-connections = Conexões TCP
 tcp-connections-allow = Permitir
 tcp-connections-ask = Perguntar
@@ -54,4 +53,3 @@ player-version = Versão do Leitor
 custom-framerate = Taxa de Frames Personalizada
 custom-framerate-suffix = { " " } fps
 dummy-external-interface = Interface Externa Fictícia
-dummy-external-interface-check = Ativar

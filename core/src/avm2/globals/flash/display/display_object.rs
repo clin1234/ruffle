@@ -1,7 +1,9 @@
 //! `flash.display.DisplayObject` builtin/prototype
 
 use crate::avm2::activation::Activation;
-use crate::avm2::error::{argument_error, illegal_operation_error, make_error_2008, type_error};
+use crate::avm2::error::{
+    argument_error, illegal_operation_error, make_error_2007, make_error_2008,
+};
 use crate::avm2::filters::FilterAvm2Ext;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::parameters::ParametersExt;
@@ -9,7 +11,6 @@ use crate::avm2::value::Value;
 use crate::avm2::StageObject;
 use crate::avm2::{ArrayObject, ArrayStorage};
 use crate::avm2::{ClassObject, Error};
-use crate::display_object::{DisplayObject, HitTestOptions, TDisplayObject};
 use crate::ecma_conversions::round_to_even;
 use crate::prelude::*;
 use crate::string::AvmString;
@@ -19,14 +20,12 @@ use crate::{avm2_stub_getter, avm2_stub_setter};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::filters::Filter;
 use std::str::FromStr;
-use swf::Rectangle;
-use swf::Twips;
 
 pub fn display_object_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let class_name = class.inner_class_definition().read().name().local_name();
+    let class_name = class.inner_class_definition().name().local_name();
 
     return Err(Error::AvmError(argument_error(
         activation,
@@ -72,10 +71,18 @@ pub fn native_instance_init<'gc>(
     activation.super_init(this, &[])?;
 
     if let Some(dobj) = this.as_display_object() {
+        if let Some(clip) = dobj.as_movie_clip() {
+            clip.set_constructing_frame(true, activation.context.gc_context);
+        }
+
         if let Some(container) = dobj.as_container() {
             for child in container.iter_render_list() {
                 child.construct_frame(&mut activation.context);
             }
+        }
+
+        if let Some(clip) = dobj.as_movie_clip() {
+            clip.set_constructing_frame(false, activation.context.gc_context);
         }
     }
 
@@ -130,10 +137,47 @@ pub fn set_height<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.as_display_object() {
         let new_height = args.get_f64(activation, 0)?;
-
         if new_height >= 0.0 {
-            dobj.set_height(activation.context.gc_context, new_height);
+            dobj.set_height(&mut activation.context, new_height);
         }
+    }
+
+    Ok(Value::Undefined)
+}
+
+/// Implements `scale9Grid`'s getter.
+pub fn get_scale9grid<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_getter!(activation, "flash.display.DisplayObject", "scale9Grid");
+    if let Some(dobj) = this.as_display_object() {
+        let rect = dobj.scaling_grid();
+        return if rect.is_valid() {
+            let rect = new_rectangle(activation, rect)?;
+            Ok(rect.into())
+        } else {
+            Ok(Value::Null)
+        };
+    }
+
+    Ok(Value::Undefined)
+}
+
+/// Implements `scale9Grid`'s setter.
+pub fn set_scale9grid<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_setter!(activation, "flash.display.DisplayObject", "scale9Grid");
+    if let Some(dobj) = this.as_display_object() {
+        let rect = match args.try_get_object(activation, 0) {
+            None => Rectangle::default(),
+            Some(rect) => object_to_rectangle(activation, rect)?,
+        };
+        dobj.set_scaling_grid(activation.context.gc_context, rect);
     }
 
     Ok(Value::Undefined)
@@ -187,9 +231,8 @@ pub fn set_width<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.as_display_object() {
         let new_width = args.get_f64(activation, 0)?;
-
         if new_width >= 0.0 {
-            dobj.set_width(activation.context.gc_context, new_width);
+            dobj.set_width(&mut activation.context, new_width);
         }
     }
 
@@ -574,7 +617,35 @@ pub fn set_visible<'gc>(
     if let Some(dobj) = this.as_display_object() {
         let new_visible = args.get_bool(0);
 
-        dobj.set_visible(activation.context.gc_context, new_visible);
+        dobj.set_visible(&mut activation.context, new_visible);
+    }
+
+    Ok(Value::Undefined)
+}
+
+/// Implements `metaData`'s getter.
+pub fn get_meta_data<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_getter!(activation, "flash.display.DisplayObject", "metaData");
+    if let Some(dobj) = this.as_display_object() {
+        return Ok(dobj.meta_data().map_or(Value::Null, Value::Object));
+    }
+
+    Ok(Value::Undefined)
+}
+
+/// Implements `metaData`'s setter.
+pub fn set_meta_data<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.as_display_object() {
+        let obj = args.get_object(activation, 0, "metaData")?;
+        dobj.set_meta_data(activation.gc(), obj);
     }
 
     Ok(Value::Undefined)
@@ -587,7 +658,7 @@ pub fn get_mouse_x<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.as_display_object() {
-        let local_mouse = dobj.mouse_to_local(*activation.context.mouse_position);
+        let local_mouse = dobj.local_mouse_position(&activation.context);
         return Ok(local_mouse.x.to_pixels().into());
     }
 
@@ -601,7 +672,7 @@ pub fn get_mouse_y<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.as_display_object() {
-        let local_mouse = dobj.mouse_to_local(*activation.context.mouse_position);
+        let local_mouse = dobj.local_mouse_position(&activation.context);
         return Ok(local_mouse.y.to_pixels().into());
     }
 
@@ -834,9 +905,6 @@ pub fn set_scroll_rect<'gc>(
                 object_to_rectangle(activation, rectangle)?,
             );
 
-            // TODO: Technically we should accept only `flash.geom.Rectangle` objects, in which case
-            // `object_to_rectangle` will be infallible. Once this happens, the following line can
-            // be moved above the `set_next_scroll_rect` call.
             dobj.set_has_scroll_rect(activation.context.gc_context, true);
         } else {
             dobj.set_has_scroll_rect(activation.context.gc_context, false);
@@ -916,7 +984,7 @@ pub fn get_bounds<'gc>(
             .and_then(|o| o.as_display_object())
             .unwrap_or(dobj);
         let bounds = dobj.bounds();
-        let out_bounds = if DisplayObject::ptr_eq(dobj, target) {
+        let mut out_bounds = if DisplayObject::ptr_eq(dobj, target) {
             // Getting the clips bounds in its own coordinate space; no AABB transform needed.
             bounds
         } else {
@@ -928,6 +996,9 @@ pub fn get_bounds<'gc>(
             let to_target_matrix = target.global_to_local_matrix().unwrap_or_default();
             to_target_matrix * to_global_matrix * bounds
         };
+        if !out_bounds.is_valid() {
+            out_bounds = Rectangle::ZERO;
+        }
 
         return Ok(new_rectangle(activation, out_bounds)?.into());
     }
@@ -1045,11 +1116,7 @@ pub fn set_blend_shader<'gc>(
             .get_public_property("data", activation)?
             .as_object()
         else {
-            return Err(Error::AvmError(type_error(
-                activation,
-                "Error #2007: Parameter data must be non-null.",
-                2007,
-            )?));
+            return Err(make_error_2007(activation, "data"));
         };
 
         let shader_handle = shader_data

@@ -14,10 +14,8 @@ use crate::avm2::object::{
 use crate::avm2::value::Value;
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::Error;
-use crate::avm2::Multiname;
 use crate::avm2::QName;
 use crate::string::AvmString;
-use gc_arena::GcCell;
 use std::cmp::{max, min, Ordering};
 
 pub fn generic_vector_allocator<'gc>(
@@ -266,7 +264,6 @@ pub fn concat<'gc>(
         if !arg.is_of_type(activation, my_base_vector_class.inner_class_definition()) {
             let base_vector_name = my_base_vector_class
                 .inner_class_definition()
-                .read()
                 .name()
                 .to_qualified_name_err_message(activation.context.gc_context);
 
@@ -296,8 +293,8 @@ pub fn concat<'gc>(
                         .ok_or("TypeError: Tried to concat a bare object into a Vector")?;
                     return Err(format!(
                         "TypeError: Cannot coerce Vector value of type {:?} to type {:?}",
-                        other_val_class.read().name(),
-                        val_class.read().name()
+                        other_val_class.name(),
+                        val_class.name()
                     )
                     .into());
                 }
@@ -329,7 +326,7 @@ where
         let string_separator = separator.coerce_to_string(activation)?;
         let mut accum = Vec::with_capacity(vector.length());
 
-        for (_, item) in vector.iter().enumerate() {
+        for item in vector.iter() {
             if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
                 accum.push("null".into());
             } else {
@@ -913,33 +910,38 @@ pub fn splice<'gc>(
 }
 
 /// Construct `Vector`'s class.
-pub fn create_generic_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_generic_class<'gc>(activation: &mut Activation<'_, 'gc>) -> Class<'gc> {
     let mc = activation.context.gc_context;
     let class = Class::new(
         QName::new(activation.avm2().vector_public_namespace, "Vector"),
-        Some(Multiname::new(activation.avm2().public_namespace, "Object")),
+        Some(activation.avm2().classes().object.inner_class_definition()),
         Method::from_builtin(generic_init, "<Vector instance initializer>", mc),
         Method::from_builtin(generic_init, "<Vector class initializer>", mc),
         mc,
     );
 
-    let mut write = class.write(mc);
-    write.set_attributes(ClassAttributes::GENERIC | ClassAttributes::FINAL);
-    write.set_instance_allocator(generic_vector_allocator);
+    class.set_attributes(mc, ClassAttributes::GENERIC | ClassAttributes::FINAL);
+    class.set_instance_allocator(mc, generic_vector_allocator);
+
+    class.mark_traits_loaded(activation.context.gc_context);
+    class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
+
     class
 }
 
 /// Construct `Vector.<int/uint/Number/*>`'s class.
 pub fn create_builtin_class<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    param: Option<GcCell<'gc, Class<'gc>>>,
-) -> GcCell<'gc, Class<'gc>> {
+    param: Option<Class<'gc>>,
+) -> Class<'gc> {
     let mc = activation.context.gc_context;
 
     // FIXME - we should store a `Multiname` instead of a `QName`, and use the
     // `params` field. For now, this is good enough to get tests passing
     let name = if let Some(param) = param {
-        let name = format!("Vector.<{}>", param.read().name().to_qualified_name(mc));
+        let name = format!("Vector.<{}>", param.name().to_qualified_name(mc));
         QName::new(
             activation.avm2().vector_public_namespace,
             AvmString::new_utf8(mc, name),
@@ -950,26 +952,23 @@ pub fn create_builtin_class<'gc>(
 
     let class = Class::new(
         name,
-        Some(Multiname::new(activation.avm2().public_namespace, "Object")),
+        Some(activation.avm2().classes().object.inner_class_definition()),
         Method::from_builtin(instance_init, "<Vector.<T> instance initializer>", mc),
         Method::from_builtin(class_init, "<Vector.<T> class initializer>", mc),
         mc,
     );
 
-    let mut write = class.write(mc);
-
     // TODO: Vector.<*> is also supposed to be final, but currently
     // that'd make it impossible for us to create derived Vector.<MyType>.
     if param.is_some() {
-        write.set_attributes(ClassAttributes::FINAL);
+        class.set_attributes(mc, ClassAttributes::FINAL);
     }
-    write.set_param(Some(param));
-    write.set_instance_allocator(vector_allocator);
-    write.set_call_handler(Method::from_builtin(
-        class_call,
-        "<Vector.<T> call handler>",
+    class.set_param(mc, Some(param));
+    class.set_instance_allocator(mc, vector_allocator);
+    class.set_call_handler(
         mc,
-    ));
+        Method::from_builtin(class_call, "<Vector.<T> call handler>", mc),
+    );
 
     const PUBLIC_INSTANCE_PROPERTIES: &[(
         &str,
@@ -979,9 +978,9 @@ pub fn create_builtin_class<'gc>(
         ("length", Some(length), Some(set_length)),
         ("fixed", Some(fixed), Some(set_fixed)),
     ];
-    write.define_builtin_instance_properties(
+    class.define_builtin_instance_properties(
         mc,
-        activation.avm2().public_namespace,
+        activation.avm2().public_namespace_base_version,
         PUBLIC_INSTANCE_PROPERTIES,
     );
 
@@ -1008,11 +1007,16 @@ pub fn create_builtin_class<'gc>(
         ("sort", sort),
         ("splice", splice),
     ];
-    write.define_builtin_instance_methods(
+    class.define_builtin_instance_methods(
         mc,
         activation.avm2().as3_namespace,
         AS3_INSTANCE_METHODS,
     );
+
+    class.mark_traits_loaded(activation.context.gc_context);
+    class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
 
     class
 }

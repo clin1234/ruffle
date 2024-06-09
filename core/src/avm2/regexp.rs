@@ -104,6 +104,7 @@ impl<'gc> RegExp<'gc> {
                     dot_all: self.flags.contains(RegExpFlags::DOTALL),
                     no_opt: false,
                     unicode: false,
+                    unicode_sets: false,
                 },
             );
             self.cached_regex = Some(re.map_err(drop));
@@ -373,6 +374,7 @@ struct CachedText<'gc> {
     // Cached values of the last `{utf8, utf16}_index` call,
     // to avoid unnecessary recomputation when calling these methods
     // with increasing indices.
+    // TODO WStrToUtf8 implements UTF-8/UTF-16 index mapping, merge it if possible
     cur_utf8_index: usize,
     cur_utf16_index: usize,
 }

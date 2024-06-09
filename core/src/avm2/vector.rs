@@ -7,7 +7,7 @@ use crate::avm2::value::Value;
 use crate::avm2::Error;
 use gc_arena::Collect;
 use std::cmp::{max, min};
-use std::ops::{Index, RangeBounds};
+use std::ops::RangeBounds;
 use std::slice::SliceIndex;
 
 /// The vector storage portion of a vector object.
@@ -153,8 +153,8 @@ impl<'gc> VectorStorage<'gc> {
 
     /// Change an arbitrary i32 into a positive parameter index.
     ///
-    /// This converts negative indicies into positive indicies indexed from the
-    /// end of the array. Negative indicies that point before the start of the
+    /// This converts negative indices into positive indices indexed from the
+    /// end of the array. Negative indices that point before the start of the
     /// array are clamped to zero.
     pub fn clamp_parameter_index(&self, pos: i32) -> usize {
         if pos < 0 {
@@ -170,7 +170,7 @@ impl<'gc> VectorStorage<'gc> {
         pos: usize,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if let Some(val) = self.storage.get(pos).cloned() {
+        if let Some(val) = self.get_optional(pos) {
             Ok(val)
         } else {
             Err(Error::AvmError(range_error(
@@ -182,6 +182,11 @@ impl<'gc> VectorStorage<'gc> {
                 1125,
             )?))
         }
+    }
+
+    /// Retrieve a value from the vector or `None` for out-of-bounds.
+    pub fn get_optional(&self, index: usize) -> Option<Value<'gc>> {
+        self.storage.get(index).cloned()
     }
 
     /// Store a value into the vector.
@@ -396,10 +401,7 @@ impl<'gc> VectorStorage<'gc> {
     where
         R: Clone + SliceIndex<[Value<'gc>], Output = [Value<'gc>]> + RangeBounds<usize>,
     {
-        if self.is_fixed && self.storage.index(range.clone()).len() != replace_with.len() {
-            return Err("RangeError: Vector is fixed".into());
-        }
-
+        // NOTE: no fixed check here for bug compatibility
         Ok(self.storage.splice(range, replace_with).collect())
     }
 }

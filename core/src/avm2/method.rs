@@ -1,16 +1,19 @@
 //! AVM2 methods
 
 use crate::avm2::activation::Activation;
+use crate::avm2::class::Class;
 use crate::avm2::object::{ClassObject, Object};
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::value::{abc_default_value, Value};
+use crate::avm2::verify::{resolve_param_config, VerifiedMethodInfo};
 use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
 use gc_arena::barrier::unlock;
 use gc_arena::lock::Lock;
-use gc_arena::{Collect, Gc, Mutation};
+use gc_arena::{Collect, Gc, GcCell, Mutation};
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -34,6 +37,21 @@ pub type NativeMethodImpl = for<'gc> fn(
     Object<'gc>,
     &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>>;
+
+/// Configuration of a single parameter of a method,
+/// with the parameter's type resolved.
+#[derive(Clone, Collect, Debug)]
+#[collect(no_drop)]
+pub struct ResolvedParamConfig<'gc> {
+    /// The name of the parameter.
+    pub param_name: AvmString<'gc>,
+
+    /// The type of the parameter.
+    pub param_type: Option<Class<'gc>>,
+
+    /// The default value for this parameter.
+    pub default_value: Option<Value<'gc>>,
+}
 
 /// Configuration of a single parameter of a method.
 #[derive(Clone, Collect, Debug)]
@@ -63,7 +81,7 @@ impl<'gc> ParamConfig<'gc> {
             AvmString::from("<Unnamed Parameter>")
         };
         let param_type_name = txunit
-            .pool_multiname_static_any(config.kind, &mut activation.borrow_gc())?
+            .pool_multiname_static_any(config.kind, &mut activation.context)?
             .deref()
             .clone();
 
@@ -102,7 +120,7 @@ impl<'gc> ParamConfig<'gc> {
 }
 
 /// Represents a reference to an AVM2 method and body.
-#[derive(Collect, Clone)]
+#[derive(Collect)]
 #[collect(no_drop)]
 pub struct BytecodeMethod<'gc> {
     /// The translation unit this function was defined in.
@@ -117,6 +135,8 @@ pub struct BytecodeMethod<'gc> {
 
     /// The ABC method body this function uses.
     pub abc_method_body: Option<u32>,
+
+    pub verified_info: GcCell<'gc, Option<VerifiedMethodInfo<'gc>>>,
 
     /// The parameter signature of this method.
     pub signature: Vec<ParamConfig<'gc>>,
@@ -145,6 +165,7 @@ impl<'gc> BytecodeMethod<'gc> {
     ) -> Result<Self, Error<'gc>> {
         let abc = txunit.abc();
         let mut signature = Vec::new();
+        let mut return_type = Multiname::any(activation.gc());
 
         if abc.methods.get(abc_method.0 as usize).is_some() {
             let method = &abc.methods[abc_method.0 as usize];
@@ -152,8 +173,8 @@ impl<'gc> BytecodeMethod<'gc> {
                 signature.push(ParamConfig::from_abc_param(param, txunit, activation)?);
             }
 
-            let return_type = txunit
-                .pool_multiname_static_any(method.return_type, &mut activation.borrow_gc())?
+            return_type = txunit
+                .pool_multiname_static_any(method.return_type, &mut activation.context)?
                 .deref()
                 .clone();
 
@@ -164,6 +185,7 @@ impl<'gc> BytecodeMethod<'gc> {
                         abc: txunit.abc(),
                         abc_method: abc_method.0,
                         abc_method_body: Some(index as u32),
+                        verified_info: GcCell::new(activation.context.gc_context, None),
                         signature,
                         return_type,
                         is_function,
@@ -178,8 +200,9 @@ impl<'gc> BytecodeMethod<'gc> {
             abc: txunit.abc(),
             abc_method: abc_method.0,
             abc_method_body: None,
+            verified_info: GcCell::new(activation.context.gc_context, None),
             signature,
-            return_type: Multiname::any(activation.gc()),
+            return_type,
             is_function,
             activation_class: Lock::new(None),
         })
@@ -216,24 +239,40 @@ impl<'gc> BytecodeMethod<'gc> {
         }
     }
 
+    #[inline(never)]
+    pub fn verify(&self, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
+        // TODO: avmplus seems to eaglerly verify some methods
+
+        *self.verified_info.write(activation.context.gc_context) =
+            Some(crate::avm2::verify::verify_method(activation, self)?);
+
+        Ok(())
+    }
+
     /// Get the list of method params for this method.
     pub fn signature(&self) -> &[ParamConfig<'gc>] {
         &self.signature
     }
 
+    pub fn resolved_return_type(&self) -> Option<Class<'gc>> {
+        let verified_info = self.verified_info.read();
+
+        verified_info.as_ref().unwrap().return_type
+    }
+
     /// Get the name of this method.
-    pub fn method_name(&self) -> &str {
+    pub fn method_name(&self) -> Cow<'_, str> {
         let name_index = self.method().name.0 as usize;
         if name_index == 0 {
-            return "";
+            return Cow::Borrowed("");
         }
 
         self.abc
             .constant_pool
             .strings
             .get(name_index - 1)
-            .map(|s| s.as_str())
-            .unwrap_or("")
+            .map(|s| String::from_utf8_lossy(s))
+            .unwrap_or(Cow::Borrowed(""))
     }
 
     /// Determine if a given method is variadic.
@@ -302,12 +341,27 @@ pub struct NativeMethod<'gc> {
     /// The parameter signature of the method.
     pub signature: Vec<ParamConfig<'gc>>,
 
+    /// The resolved parameter signature of the method.
+    pub resolved_signature: GcCell<'gc, Option<Vec<ResolvedParamConfig<'gc>>>>,
+
     /// The return type of this method.
     pub return_type: Multiname<'gc>,
 
     /// Whether or not this method accepts parameters beyond those
     /// mentioned in the parameter list.
     pub is_variadic: bool,
+}
+
+impl<'gc> NativeMethod<'gc> {
+    pub fn resolve_signature(
+        &self,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<(), Error<'gc>> {
+        *self.resolved_signature.write(activation.context.gc_context) =
+            Some(resolve_param_config(activation, &self.signature)?);
+
+        Ok(())
+    }
 }
 
 impl<'gc> fmt::Debug for NativeMethod<'gc> {
@@ -355,6 +409,7 @@ impl<'gc> Method<'gc> {
                 method,
                 name,
                 signature,
+                resolved_signature: GcCell::new(mc, None),
                 return_type,
                 is_variadic,
             },
@@ -369,6 +424,7 @@ impl<'gc> Method<'gc> {
                 method,
                 name,
                 signature: Vec::new(),
+                resolved_signature: GcCell::new(mc, None),
                 // FIXME - take in the real return type. This is needed for 'describeType'
                 return_type: Multiname::any(mc),
                 is_variadic: true,

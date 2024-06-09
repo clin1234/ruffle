@@ -348,6 +348,7 @@ include "flash/text/TextFormatDisplay.as"
 include "flash/text/TextInteractionMode.as"
 include "flash/text/TextLineMetrics.as"
 include "flash/text/TextRenderer.as"
+include "flash/text/TextSnapshot.as"
 
 include "flash/text/engine/BreakOpportunity.as"
 include "flash/text/engine/CFFHinting.as"
@@ -382,6 +383,9 @@ include "flash/text/engine/TextLineCreationResult.as"
 include "flash/text/engine/TextLineValidity.as"
 include "flash/text/engine/TextRotation.as"
 include "flash/text/engine/TypographicCase.as"
+
+include "flash/text/ime/CompositionAttributeRange.as"
+include "flash/text/ime/IIMEClient.as"
 
 include "flash/ui/ContextMenu.as"
 include "flash/ui/ContextMenuBuiltInItems.as"

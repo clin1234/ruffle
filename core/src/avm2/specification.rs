@@ -1,5 +1,5 @@
 use crate::avm2::dynamic_map::DynamicKey;
-use crate::avm2::function::Executable;
+use crate::avm2::function::BoundMethod;
 use crate::avm2::method::{Method, ParamConfig};
 use crate::avm2::object::TObject;
 use crate::avm2::traits::{Trait, TraitKind};
@@ -166,7 +166,7 @@ impl FunctionInfo {
         }
     }
 
-    pub fn from_executable(executable: &Executable, stubbed: bool) -> Self {
+    pub fn from_bound_method(executable: &BoundMethod, stubbed: bool) -> Self {
         Self {
             returns: executable
                 .return_type()
@@ -271,20 +271,19 @@ impl Definition {
         let mut definition = Self::default();
         let class = class_object.inner_class_definition();
 
-        if class.read().is_final() {
+        if class.is_final() {
             definition
                 .classinfo
                 .get_or_insert_with(Default::default)
                 .is_final = true;
         }
-        if !class.read().is_sealed() {
+        if !class.is_sealed() {
             definition
                 .classinfo
                 .get_or_insert_with(Default::default)
                 .dynamic = true;
         }
         if let Some(super_name) = class
-            .read()
             .super_class_name()
             .as_ref()
             .and_then(|n| n.local_name())
@@ -322,13 +321,13 @@ impl Definition {
 
         Self::fill_traits(
             activation.avm2(),
-            class.read().class_traits(),
+            &class.class_traits(),
             &mut definition.static_traits,
             stubs,
         );
         Self::fill_traits(
             activation.avm2(),
-            class.read().instance_traits(),
+            &class.instance_traits(),
             &mut definition.instance_traits,
             stubs,
         );
@@ -346,7 +345,7 @@ impl Definition {
             if let Some(executable) = object.as_executable() {
                 output.get_or_insert_with(Default::default).function.insert(
                     name.to_string(),
-                    FunctionInfo::from_executable(&executable, false),
+                    FunctionInfo::from_bound_method(&executable, false),
                 );
             }
         } else {
@@ -476,7 +475,6 @@ pub fn capture_specification(context: &mut UpdateContext, output: &Path) {
             if let Some(class) = object.as_class_object() {
                 let class_name = class
                     .inner_class_definition()
-                    .read()
                     .name()
                     .to_qualified_name_err_message(activation.context.gc_context)
                     .to_string();
@@ -496,7 +494,7 @@ pub fn capture_specification(context: &mut UpdateContext, output: &Path) {
                     .get_or_insert_with(Default::default);
                 instance_traits.function.insert(
                     name.to_string(),
-                    FunctionInfo::from_executable(
+                    FunctionInfo::from_bound_method(
                         &executable,
                         namespace_stubs.has_method(&name.to_string()),
                     ),

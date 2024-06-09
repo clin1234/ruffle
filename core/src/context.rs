@@ -21,7 +21,7 @@ use crate::backend::{
     ui::{InputManager, UiBackend},
 };
 use crate::context_menu::ContextMenuState;
-use crate::display_object::{EditText, InteractiveObject, MovieClip, SoundTransform, Stage};
+use crate::display_object::{EditText, MovieClip, SoundTransform, Stage};
 use crate::external::ExternalInterface;
 use crate::focus_tracker::FocusTracker;
 use crate::frame_lifecycle::FramePhase;
@@ -29,8 +29,8 @@ use crate::library::Library;
 use crate::loader::LoadManager;
 use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
-use crate::player::Player;
 use crate::player::PostFrameCallback;
+use crate::player::{MouseData, Player};
 use crate::prelude::*;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
@@ -44,7 +44,7 @@ use core::fmt;
 use gc_arena::{Collect, Mutation};
 use rand::rngs::SmallRng;
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
-use ruffle_render::commands::CommandList;
+use ruffle_render::commands::{CommandHandler, CommandList};
 use ruffle_render::transform::TransformStack;
 use ruffle_video::backend::VideoBackend;
 use std::collections::{HashMap, VecDeque};
@@ -147,11 +147,7 @@ pub struct UpdateContext<'a, 'gc> {
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
 
-    /// The display object that the mouse is currently hovering over.
-    pub mouse_over_object: Option<InteractiveObject<'gc>>,
-
-    /// If the mouse is down, the display object that the mouse is currently pressing.
-    pub mouse_down_object: Option<InteractiveObject<'gc>>,
+    pub mouse_data: &'a mut MouseData<'gc>,
 
     /// The input manager, tracking keys state.
     pub input: &'a InputManager,
@@ -333,7 +329,7 @@ impl<'a, 'gc> UpdateContext<'a, 'gc> {
         &mut self,
         movie_clip: MovieClip<'gc>,
         frame: u16,
-        data: crate::tag_utils::SwfSlice,
+        data: SwfSlice,
         stream_info: &swf::SoundStreamHead,
     ) -> Option<SoundInstanceHandle> {
         self.audio_manager
@@ -505,8 +501,7 @@ impl<'a, 'gc> UpdateContext<'a, 'gc> {
             storage: self.storage,
             rng: self.rng,
             stage: self.stage,
-            mouse_over_object: self.mouse_over_object,
-            mouse_down_object: self.mouse_down_object,
+            mouse_data: self.mouse_data,
             input: self.input,
             mouse_position: self.mouse_position,
             drag_object: self.drag_object,
@@ -652,7 +647,7 @@ pub struct RenderContext<'a, 'gc> {
     /// Whether we're rendering offscreen. This can disable some logic like Ruffle-side render culling
     pub is_offscreen: bool,
 
-    /// Whether or not to use cacheAsBitmap, vs drawing everything explicitly
+    /// Whether to use cacheAsBitmap, vs drawing everything explicitly
     pub use_bitmap_cache: bool,
 
     /// The current player's stage (including all loaded levels)
@@ -665,6 +660,48 @@ impl<'a, 'gc> RenderContext<'a, 'gc> {
     #[inline(always)]
     pub fn gc(&self) -> &'gc Mutation<'gc> {
         self.gc_context
+    }
+
+    /// Draw a rectangle outline.
+    ///
+    /// The outline is contained within the given bounds.
+    pub fn draw_rect_outline(&mut self, color: Color, bounds: Rectangle<Twips>, thickness: Twips) {
+        let bounds = self.transform_stack.transform().matrix * bounds;
+        let width = bounds.width().to_pixels() as f32;
+        let height = bounds.height().to_pixels() as f32;
+        let thickness_pixels = thickness.to_pixels() as f32;
+        // Top
+        self.commands.draw_rect(
+            color,
+            Matrix::create_box(width, thickness_pixels, 0.0, bounds.x_min, bounds.y_min),
+        );
+        // Bottom
+        self.commands.draw_rect(
+            color,
+            Matrix::create_box(
+                width,
+                thickness_pixels,
+                0.0,
+                bounds.x_min,
+                bounds.y_max - thickness,
+            ),
+        );
+        // Left
+        self.commands.draw_rect(
+            color,
+            Matrix::create_box(thickness_pixels, height, 0.0, bounds.x_min, bounds.y_min),
+        );
+        // Right
+        self.commands.draw_rect(
+            color,
+            Matrix::create_box(
+                thickness_pixels,
+                height,
+                0.0,
+                bounds.x_max - thickness,
+                bounds.y_min,
+            ),
+        );
     }
 }
 

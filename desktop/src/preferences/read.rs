@@ -1,7 +1,7 @@
 use crate::preferences::SavedGlobalPreferences;
-use ruffle_frontend_utils::bookmarks::{Bookmark, Bookmarks};
-use ruffle_frontend_utils::parse::{DocumentHolder, ParseContext, ParseResult, ReadExt};
-use std::str::FromStr;
+use ruffle_frontend_utils::parse::{
+    DocumentHolder, ParseContext, ParseDetails, ParseWarning, ReadExt,
+};
 use toml_edit::DocumentMut;
 
 /// Read the given preferences into a **guaranteed valid** `SavedGlobalPreferences`,
@@ -13,13 +13,13 @@ use toml_edit::DocumentMut;
 /// Default values are used wherever an unknown or invalid value is found;
 /// this is to support the case of, for example, a later version having different supported
 /// backends than an older version.
-pub fn read_preferences(input: &str) -> ParseResult<SavedGlobalPreferences> {
+pub fn read_preferences(input: &str) -> ParseDetails<SavedGlobalPreferences> {
     let document = match input.parse::<DocumentMut>() {
         Ok(document) => document,
         Err(e) => {
-            return ParseResult {
+            return ParseDetails {
                 result: Default::default(),
-                warnings: vec![format!("Invalid TOML: {e}")],
+                warnings: vec![ParseWarning::InvalidToml(e)],
             }
         }
     };
@@ -51,6 +51,14 @@ pub fn read_preferences(input: &str) -> ParseResult<SavedGlobalPreferences> {
         result.mute = value;
     };
 
+    if let Some(value) = document.get_bool(&mut cx, "enable_openh264") {
+        result.enable_openh264 = value;
+    };
+
+    if let Some(value) = document.get_integer(&mut cx, "recent_limit") {
+        result.recent_limit = value as usize;
+    }
+
     document.get_table_like(&mut cx, "log", |cx, log| {
         if let Some(value) = log.parse_from_str(cx, "filename_pattern") {
             result.log.filename_pattern = value;
@@ -63,51 +71,12 @@ pub fn read_preferences(input: &str) -> ParseResult<SavedGlobalPreferences> {
         }
     });
 
-    ParseResult {
-        result: DocumentHolder::new(result, document),
+    ParseDetails {
         warnings: cx.warnings,
+        result: DocumentHolder::new(result, document),
     }
 }
 
-pub fn read_bookmarks(input: &str) -> ParseResult<Bookmarks> {
-    let document = match input.parse::<DocumentMut>() {
-        Ok(document) => document,
-        Err(e) => {
-            return ParseResult {
-                result: Default::default(),
-                warnings: vec![format!("Invalid TOML: {e}")],
-            }
-        }
-    };
-
-    let mut result = Vec::new();
-    let mut cx = ParseContext::default();
-
-    document.get_array_of_tables(&mut cx, "bookmark", |cx, bookmarks| {
-        for bookmark in bookmarks.iter() {
-            let url = match bookmark.parse_from_str(cx, "url") {
-                Some(value) => value,
-                None => url::Url::parse(ruffle_frontend_utils::bookmarks::INVALID_URL)
-                    .expect("Url is constant and valid"),
-            };
-
-            let name = match bookmark.parse_from_str(cx, "name") {
-                Some(value) => value,
-                // Fallback to using the URL as the name.
-                None => crate::util::url_to_readable_name(&url).into_owned(),
-            };
-
-            result.push(Bookmark { url, name });
-        }
-    });
-
-    ParseResult {
-        result: DocumentHolder::new(result, document),
-        warnings: cx.warnings,
-    }
-}
-
-#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,14 +84,14 @@ mod tests {
     use crate::preferences::{storage::StorageBackend, LogPreferences, StoragePreferences};
     use fluent_templates::loader::langid;
     use ruffle_render_wgpu::clap::{GraphicsBackend, PowerPreference};
-    use url::Url;
 
     #[test]
     fn invalid_toml() {
         let result = read_preferences("~~INVALID~~");
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
-        assert_eq!(vec!["Invalid TOML: TOML parse error at line 1, column 1\n  |\n1 | ~~INVALID~~\n  | ^\ninvalid key\n".to_string()], result.warnings);
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!("Invalid TOML: TOML parse error at line 1, column 1\n  |\n1 | ~~INVALID~~\n  | ^\ninvalid key\n", result.warnings[0].to_string());
     }
 
     #[test]
@@ -130,7 +99,7 @@ mod tests {
         let result = read_preferences("");
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -139,7 +108,11 @@ mod tests {
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid graphics_backend: expected string but found integer".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "graphics_backend".to_string()
+            }],
             result.warnings
         );
     }
@@ -150,7 +123,10 @@ mod tests {
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid graphics_backend: unsupported value \"fast\"".to_string()],
+            vec![ParseWarning::UnsupportedValue {
+                value: "fast".to_string(),
+                path: "graphics_backend".to_string()
+            }],
             result.warnings
         );
     }
@@ -166,7 +142,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -175,9 +151,11 @@ mod tests {
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec![
-                "Invalid graphics_power_preference: expected string but found integer".to_string()
-            ],
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "graphics_power_preference".to_string()
+            }],
             result.warnings
         );
     }
@@ -188,7 +166,10 @@ mod tests {
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid graphics_power_preference: unsupported value \"fast\"".to_string()],
+            vec![ParseWarning::UnsupportedValue {
+                value: "fast".to_string(),
+                path: "graphics_power_preference".to_string()
+            }],
             result.warnings
         );
     }
@@ -204,7 +185,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -213,7 +194,10 @@ mod tests {
 
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid language: unsupported value \"???\"".to_string()],
+            vec![ParseWarning::UnsupportedValue {
+                value: "???".to_string(),
+                path: "language".to_string()
+            }],
             result.warnings
         );
     }
@@ -229,7 +213,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -243,7 +227,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -258,7 +242,11 @@ mod tests {
             result.values()
         );
         assert_eq!(
-            vec!["Invalid output_device: expected string but found integer".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "output_device".to_string()
+            }],
             result.warnings
         );
     }
@@ -274,7 +262,11 @@ mod tests {
             result.values()
         );
         assert_eq!(
-            vec!["Invalid mute: expected boolean but found string".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "boolean",
+                actual: "string",
+                path: "mute".to_string()
+            }],
             result.warnings
         );
 
@@ -286,7 +278,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
 
         let result = read_preferences("");
         assert_eq!(
@@ -296,7 +288,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -310,7 +302,11 @@ mod tests {
             result.values()
         );
         assert_eq!(
-            vec!["Invalid volume: expected float but found string".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "float",
+                actual: "string",
+                path: "volume".to_string()
+            }],
             result.warnings
         );
 
@@ -322,7 +318,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
 
         let result = read_preferences("volume = -1.0");
         assert_eq!(
@@ -332,7 +328,47 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
+    }
+
+    #[test]
+    fn enable_openh264() {
+        let result = read_preferences("enable_openh264 = \"true\"");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                enable_openh264: true,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(
+            vec![ParseWarning::UnexpectedType {
+                expected: "boolean",
+                actual: "string",
+                path: "enable_openh264".to_string()
+            }],
+            result.warnings
+        );
+
+        let result = read_preferences("enable_openh264 = false");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                enable_openh264: false,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
+
+        let result = read_preferences("");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                enable_openh264: true,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -348,14 +384,21 @@ mod tests {
             result.values()
         );
         assert_eq!(
-            vec!["Invalid log.filename_pattern: expected string but found integer".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "log.filename_pattern".to_string()
+            }],
             result.warnings
         );
 
         let result = read_preferences("log = {filename_pattern = \"???\"}");
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid log.filename_pattern: unsupported value \"???\"".to_string()],
+            vec![ParseWarning::UnsupportedValue {
+                value: "???".to_string(),
+                path: "log.filename_pattern".to_string()
+            }],
             result.warnings
         );
 
@@ -369,7 +412,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -377,7 +420,11 @@ mod tests {
         let result = read_preferences("log = \"yes\"");
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid log: expected table but found string".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "table",
+                actual: "string",
+                path: "log".to_string()
+            }],
             result.warnings
         );
     }
@@ -387,14 +434,21 @@ mod tests {
         let result = read_preferences("storage = {backend = 5}");
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid storage.backend: expected string but found integer".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "storage.backend".to_string()
+            }],
             result.warnings
         );
 
         let result = read_preferences("storage = {backend = \"???\"}");
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid storage.backend: unsupported value \"???\"".to_string()],
+            vec![ParseWarning::UnsupportedValue {
+                value: "???".to_string(),
+                path: "storage.backend".to_string()
+            }],
             result.warnings
         );
 
@@ -408,7 +462,7 @@ mod tests {
             },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 
     #[test]
@@ -416,120 +470,59 @@ mod tests {
         let result = read_preferences("storage = \"no\"");
         assert_eq!(&SavedGlobalPreferences::default(), result.values());
         assert_eq!(
-            vec!["Invalid storage: expected table but found string".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "table",
+                actual: "string",
+                path: "storage".to_string()
+            }],
             result.warnings
         );
     }
 
     #[test]
-    fn bookmark() {
-        let result = read_bookmarks("[bookmark]");
-        assert_eq!(&Vec::<Bookmark>::new(), result.values());
+    fn recent_limit() {
+        let result = read_preferences("recent_limit = \"1\"");
         assert_eq!(
-            vec!["Invalid bookmark: expected array of tables but found table".to_string()],
+            &SavedGlobalPreferences {
+                recent_limit: 10,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(
+            vec![ParseWarning::UnexpectedType {
+                expected: "integer",
+                actual: "string",
+                path: "recent_limit".to_string(),
+            }],
             result.warnings
         );
 
-        let result = read_bookmarks("[[bookmark]]");
+        let result = read_preferences("recent_limit = 0.5");
         assert_eq!(
-            &vec![Bookmark {
-                url: Url::parse(ruffle_frontend_utils::bookmarks::INVALID_URL).unwrap(),
-                name: "".to_string(),
-            }],
-            result.values()
-        );
-        assert_eq!(Vec::<String>::new(), result.warnings);
-
-        let result = read_bookmarks("[[bookmark]]\nurl = \"invalid\"");
-        assert_eq!(
-            &vec![Bookmark {
-                url: Url::parse(ruffle_frontend_utils::bookmarks::INVALID_URL).unwrap(),
-                name: "".to_string(),
-            }],
+            &SavedGlobalPreferences {
+                recent_limit: 10,
+                ..Default::default()
+            },
             result.values()
         );
         assert_eq!(
-            vec!["Invalid bookmark.url: unsupported value \"invalid\"".to_string()],
+            vec![ParseWarning::UnexpectedType {
+                expected: "integer",
+                actual: "float",
+                path: "recent_limit".to_string(),
+            }],
             result.warnings
         );
 
-        let result = read_bookmarks(
-            "[[bookmark]]\nurl = \"https://ruffle.rs/logo-anim.swf\"\nname = \"Logo SWF\"",
-        );
+        let result = read_preferences("recent_limit = 5");
         assert_eq!(
-            &vec![Bookmark {
-                url: Url::parse("https://ruffle.rs/logo-anim.swf").unwrap(),
-                name: "Logo SWF".to_string(),
-            }],
+            &SavedGlobalPreferences {
+                recent_limit: 5,
+                ..Default::default()
+            },
             result.values()
         );
-        assert_eq!(Vec::<String>::new(), result.warnings);
-    }
-
-    #[test]
-    fn multiple_bookmarks() {
-        let result = read_bookmarks(
-            r#"
-            [[bookmark]]
-            url = "file:///home/user/example.swf"
-
-            [[bookmark]]
-            url = "https://ruffle.rs/logo-anim.swf"
-            "#,
-        );
-        assert_eq!(
-            &vec![
-                Bookmark {
-                    url: Url::from_str("file:///home/user/example.swf").unwrap(),
-                    name: "example.swf".to_string(),
-                },
-                Bookmark {
-                    url: Url::from_str("https://ruffle.rs/logo-anim.swf").unwrap(),
-                    name: "logo-anim.swf".to_string(),
-                }
-            ],
-            result.values()
-        );
-        assert_eq!(Vec::<String>::new(), result.warnings);
-
-        let result = read_bookmarks(
-            r#"
-            [[bookmark]]
-            url = "file:///home/user/example.swf"
-
-            [[bookmark]]
-            url = "invalid"
-
-            [[bookmark]]
-
-            [[bookmark]]
-            url = "https://ruffle.rs/logo-anim.swf"
-            "#,
-        );
-        assert_eq!(
-            &vec![
-                Bookmark {
-                    url: Url::from_str("file:///home/user/example.swf").unwrap(),
-                    name: "example.swf".to_string(),
-                },
-                Bookmark {
-                    url: Url::parse(ruffle_frontend_utils::bookmarks::INVALID_URL).unwrap(),
-                    name: "".to_string(),
-                },
-                Bookmark {
-                    url: Url::parse(ruffle_frontend_utils::bookmarks::INVALID_URL).unwrap(),
-                    name: "".to_string(),
-                },
-                Bookmark {
-                    url: Url::from_str("https://ruffle.rs/logo-anim.swf").unwrap(),
-                    name: "logo-anim.swf".to_string(),
-                }
-            ],
-            result.values()
-        );
-        assert_eq!(
-            vec!["Invalid bookmark.url: unsupported value \"invalid\"".to_string()],
-            result.warnings
-        );
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
     }
 }

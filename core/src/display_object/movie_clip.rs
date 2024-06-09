@@ -159,10 +159,8 @@ pub struct MovieClipData<'gc> {
     frame_scripts: Vec<Option<Avm2Object<'gc>>>,
     #[collect(require_static)]
     flags: MovieClipFlags,
-    avm2_class: Option<Avm2ClassObject<'gc>>,
     #[collect(require_static)]
     drawing: Drawing,
-    has_focus: bool,
     avm2_enabled: bool,
 
     /// Show a hand cursor when the clip is in button mode.
@@ -189,10 +187,6 @@ pub struct MovieClipData<'gc> {
 
     /// Attached audio (AVM1)
     attached_audio: Option<NetStream<'gc>>,
-
-    // TODO Consider moving this to InteractiveObject along with
-    //      TextField's and Button's tab indices after AVM2 analysis
-    tab_index: Option<i32>,
 }
 
 impl<'gc> MovieClip<'gc> {
@@ -214,9 +208,7 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::empty(),
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -230,7 +222,6 @@ impl<'gc> MovieClip<'gc> {
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
                 attached_audio: None,
-                tab_index: None,
             },
         ))
     }
@@ -241,7 +232,7 @@ impl<'gc> MovieClip<'gc> {
         class: Avm2ClassObject<'gc>,
         gc_context: &Mutation<'gc>,
     ) -> Self {
-        MovieClip(GcCell::new(
+        let clip = MovieClip(GcCell::new(
             gc_context,
             MovieClipData {
                 base: Default::default(),
@@ -258,9 +249,7 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::empty(),
-                avm2_class: Some(class),
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -274,9 +263,10 @@ impl<'gc> MovieClip<'gc> {
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
                 attached_audio: None,
-                tab_index: None,
             },
-        ))
+        ));
+        clip.set_avm2_class(gc_context, Some(class));
+        clip
     }
 
     /// Constructs a non-root movie
@@ -303,9 +293,7 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::PLAYING,
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -319,7 +307,6 @@ impl<'gc> MovieClip<'gc> {
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
                 attached_audio: None,
-                tab_index: None,
             },
         ))
     }
@@ -373,9 +360,7 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::PLAYING,
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -389,7 +374,6 @@ impl<'gc> MovieClip<'gc> {
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
                 attached_audio: None,
-                tab_index: None,
             },
         ));
 
@@ -964,7 +948,7 @@ impl<'gc> MovieClip<'gc> {
                                     *avm2_bitmapdata_class.write(activation.context.gc_context) =
                                         bitmap_class;
                                 } else {
-                                    tracing::error!("Associated class {:?} for symbol {} must extend flash.display.Bitmap or BitmapData, does neither", class_object.inner_class_definition().read().name(), self.id());
+                                    tracing::error!("Associated class {:?} for symbol {} must extend flash.display.Bitmap or BitmapData, does neither", class_object.inner_class_definition().name(), self.id());
                                 }
                             }
                             _ => {
@@ -1383,8 +1367,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_avm2_class(self, gc_context: &Mutation<'gc>, constr: Option<Avm2ClassObject<'gc>>) {
-        let mut write = self.0.write(gc_context);
-        write.avm2_class = constr;
+        *self.0.read().static_data.avm2_class.write(gc_context) = constr;
     }
 
     pub fn frame_label_to_number(
@@ -2205,7 +2188,9 @@ impl<'gc> MovieClip<'gc> {
         let class_object = self
             .0
             .read()
+            .static_data
             .avm2_class
+            .read()
             .unwrap_or_else(|| context.avm2.classes().movieclip);
 
         let mut constr_thing = || {
@@ -2235,7 +2220,9 @@ impl<'gc> MovieClip<'gc> {
         let class_object = self
             .0
             .read()
+            .static_data
             .avm2_class
+            .read()
             .unwrap_or_else(|| context.avm2.classes().movieclip);
 
         if let Avm2Value::Object(object) = self.object2() {
@@ -2253,7 +2240,7 @@ impl<'gc> MovieClip<'gc> {
                     e,
                     class_object
                         .try_inner_class_definition()
-                        .map(|c| c.read().name().to_qualified_name(context.gc_context))
+                        .map(|c| c.name().to_qualified_name(context.gc_context))
                         .unwrap_or_else(|_| "[BorrowError!]".into())
                 );
             }
@@ -2561,18 +2548,6 @@ impl<'gc> MovieClip<'gc> {
                 netstream.was_attached(context, self);
             }
         }
-    }
-
-    /// Get the value of `tabIndex` used in AS.
-    ///
-    /// Do not confuse it with `tab_index`, which returns the value used for ordering.
-    pub fn tab_index_value(&self) -> Option<i32> {
-        self.0.read().tab_index
-    }
-
-    /// Set the value of `tabIndex` used in AS.
-    pub fn set_tab_index_value(&self, context: &mut UpdateContext<'_, 'gc>, value: Option<i32>) {
-        self.0.write(context.gc()).tab_index = value;
     }
 }
 
@@ -2953,13 +2928,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         }
     }
 
-    fn set_parent(&self, context: &mut UpdateContext<'_, 'gc>, parent: Option<DisplayObject<'gc>>) {
-        let had_parent = self.parent().is_some();
-        self.base_mut(context.gc_context)
-            .set_parent_ignoring_orphan_list(parent);
-        let has_parent = self.parent().is_some();
-
-        if self.movie().is_action_script_3() && had_parent && !has_parent {
+    fn on_parent_removed(&self, context: &mut UpdateContext<'_, 'gc>) {
+        if self.movie().is_action_script_3() {
             context.avm2.add_orphan_obj((*self).into())
         }
     }
@@ -2982,11 +2952,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             }
         }
 
-        let had_focus = self.0.read().has_focus;
-        if had_focus {
-            let tracker = context.focus_tracker;
-            tracker.set(None, context);
-        }
+        self.drop_focus(context);
 
         {
             let mut mc = self.0.write(context.gc_context);
@@ -3008,38 +2974,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn allow_as_mask(&self) -> bool {
         !self.is_empty()
     }
-
-    fn is_focusable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        if !self.movie().is_action_script_3() {
-            if self.is_button_mode(context) {
-                true
-            } else {
-                self.get_avm1_boolean_property(context, "focusEnabled", |_| false)
-            }
-        } else {
-            false
-        }
-    }
-
-    fn on_focus_changed(
-        &self,
-        context: &mut UpdateContext<'_, 'gc>,
-        focused: bool,
-        other: Option<DisplayObject<'gc>>,
-    ) {
-        self.0.write(context.gc_context).has_focus = focused;
-        self.call_focus_handler(context, focused, other);
-    }
-
-    fn is_tab_enabled(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        self.get_avm1_boolean_property(context, "tabEnabled", |context| {
-            self.tab_index().is_some() || self.is_button_mode(context)
-        })
-    }
-
-    fn tab_index(&self) -> Option<i64> {
-        self.0.read().tab_index.map(|i| i as i64)
-    }
 }
 
 impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
@@ -3051,15 +2985,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
         RefMut::map(self.0.write(gc_context), |this| &mut this.container)
     }
 
-    /// The property `MovieClip.tabChildren` allows changing the behavior of
-    /// tab ordering hierarchically.
-    /// When set to `false`, it excludes the whole subtree represented by
-    /// the movie clip from tab ordering.
-    ///
-    /// _NOTE:_
-    /// According to the AS2 documentation, it should affect only automatic tab ordering.
-    /// However, that does not seem to be the case, as it also affects custom ordering.
-    fn is_tab_children(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+    fn is_tab_children_avm1(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
         self.get_avm1_boolean_property(context, "tabChildren", |_| true)
     }
 }
@@ -3150,20 +3076,17 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
                 // Queue ActionScript-defined event handlers after the SWF defined ones.
                 // (e.g., clip.onEnterFrame = foo).
-                if swf_version >= 6 {
+                if self.should_fire_event_handlers(context, event) {
                     if let Some(name) = event.method_name() {
-                        // Keyboard events don't fire their methods unless the MovieClip has focus (#2120).
-                        if !event.is_key_event() || read.has_focus {
-                            context.action_queue.queue_action(
-                                self.into(),
-                                ActionType::Method {
-                                    object,
-                                    name,
-                                    args: vec![],
-                                },
-                                event == ClipEvent::Unload,
-                            );
-                        }
+                        context.action_queue.queue_action(
+                            self.into(),
+                            ActionType::Method {
+                                object,
+                                name,
+                                args: vec![],
+                            },
+                            event == ClipEvent::Unload,
+                        );
                     }
                 }
             }
@@ -3337,7 +3260,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             for child in interactive.into_iter().chain(non_interactive) {
                 // Mask children are not clickable
-                if child.clip_depth() > 0 {
+                if child.clip_depth() > 0 || child.maskee().is_some() {
                     continue;
                 }
 
@@ -3424,6 +3347,43 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         } else {
             MouseCursor::Arrow
         }
+    }
+
+    fn is_focusable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_root() {
+            false
+        } else if self.is_button_mode(context) {
+            true
+        } else {
+            self.get_avm1_boolean_property(context, "focusEnabled", |_| false)
+        }
+    }
+
+    fn is_highlightable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        // Root movie clips are not highlightable.
+        // This applies only to AVM2, as in AVM1 they are also not focusable.
+        !self.is_root() && self.is_highlight_enabled(context)
+    }
+
+    fn is_tabbable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_root() {
+            // Root movie clips are never tabbable.
+            return false;
+        }
+        self.tab_enabled(context)
+    }
+
+    fn tab_enabled_default(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_button_mode(context) {
+            return true;
+        }
+
+        let is_avm1 = !context.swf.is_action_script_3();
+        if is_avm1 && self.tab_index().is_some() {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -4655,6 +4615,7 @@ struct MovieClipStatic<'gc> {
     /// The last known symbol name under which this movie clip was exported.
     /// Used for looking up constructors registered with `Object.registerClass`.
     exported_name: GcCell<'gc, Option<AvmString<'gc>>>,
+    avm2_class: GcCell<'gc, Option<Avm2ClassObject<'gc>>>,
     /// Only set if this MovieClip is the root movie in an SWF
     /// (either the root SWF initially loaded by the player,
     /// or an SWF dynamically loaded by `Loader`)
@@ -4701,6 +4662,7 @@ impl<'gc> MovieClipStatic<'gc> {
             audio_stream_info: None,
             audio_stream_handle: None,
             exported_name: GcCell::new(gc_context, None),
+            avm2_class: GcCell::new(gc_context, None),
             loader_info,
             preload_progress: GcCell::new(gc_context, Default::default()),
             processed_bytecode_tags_pos: GcCell::new(gc_context, -1),

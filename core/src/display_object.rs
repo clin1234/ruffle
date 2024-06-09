@@ -1,6 +1,6 @@
 use crate::avm1::{
-    ActivationIdentifier as Avm1ActivationIdentifier, ExecutionReason as Avm1ExecutionReason,
-    Object as Avm1Object, TObject as Avm1TObject, Value as Avm1Value,
+    ActivationIdentifier as Avm1ActivationIdentifier, Object as Avm1Object, TObject as Avm1TObject,
+    Value as Avm1Value,
 };
 use crate::avm2::{
     Activation as Avm2Activation, Avm2, Error as Avm2Error, EventObject as Avm2EventObject,
@@ -463,8 +463,15 @@ impl<'gc> DisplayObjectBase<'gc> {
             value = 0.0.into();
         }
 
-        let cos = f64::cos(self.rotation.into_radians());
-        let sin = f64::sin(self.rotation.into_radians());
+        // Similarly, a rotation of `NaN` can be reported to ActionScript, but we
+        // treat it as 0.0 when calculating the matrix
+        let mut rot = self.rotation.into_radians();
+        if rot.is_nan() {
+            rot = 0.0;
+        }
+
+        let cos = f64::cos(rot);
+        let sin = f64::sin(rot);
         let matrix = &mut self.transform.matrix;
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
@@ -490,8 +497,15 @@ impl<'gc> DisplayObjectBase<'gc> {
             value = 0.0.into();
         }
 
-        let cos = f64::cos(self.rotation.into_radians() + self.skew);
-        let sin = f64::sin(self.rotation.into_radians() + self.skew);
+        // Similarly, a rotation of `NaN` can be reported to ActionScript, but we
+        // treat it as 0.0 when calculating the matrix
+        let mut rot = self.rotation.into_radians();
+        if rot.is_nan() {
+            rot = 0.0;
+        }
+
+        let cos = f64::cos(rot + self.skew);
+        let sin = f64::sin(rot + self.skew);
         let matrix = &mut self.transform.matrix;
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
@@ -1587,9 +1601,24 @@ pub trait TDisplayObject<'gc>:
 
     /// Set the parent of this display object.
     fn set_parent(&self, context: &mut UpdateContext<'_, 'gc>, parent: Option<DisplayObject<'gc>>) {
+        let had_parent = self.parent().is_some();
         self.base_mut(context.gc_context)
             .set_parent_ignoring_orphan_list(parent);
+        let has_parent = self.parent().is_some();
+        let parent_removed = had_parent && !has_parent;
+
+        if parent_removed {
+            if let Some(int) = self.as_interactive() {
+                int.drop_focus(context);
+            }
+
+            self.on_parent_removed(context);
+        }
     }
+
+    /// This method is called when the parent is removed.
+    /// It may be overwritten to inject some implementation-specific behavior.
+    fn on_parent_removed(&self, _context: &mut UpdateContext<'_, 'gc>) {}
 
     /// Retrieve the parent of this display object.
     ///
@@ -1709,11 +1738,18 @@ pub trait TDisplayObject<'gc>:
     /// Sets whether this display object will be visible.
     /// Invisible objects are not rendered, but otherwise continue to exist normally.
     /// Returned by the `_visible`/`visible` ActionScript properties.
-    fn set_visible(&self, gc_context: &Mutation<'gc>, value: bool) {
-        if self.base_mut(gc_context).set_visible(value) {
+    fn set_visible(&self, context: &mut UpdateContext<'_, 'gc>, value: bool) {
+        if self.base_mut(context.gc()).set_visible(value) {
             if let Some(parent) = self.parent() {
                 // We don't need to invalidate ourselves, we're just toggling if the bitmap is rendered.
-                parent.invalidate_cached_bitmap(gc_context);
+                parent.invalidate_cached_bitmap(context.gc());
+            }
+        }
+
+        if !value {
+            if let Some(int) = self.as_interactive() {
+                // The focus is dropped when it's made invisible.
+                int.drop_focus(context);
             }
         }
     }
@@ -1842,88 +1878,6 @@ pub trait TDisplayObject<'gc>:
     /// Sets whether this display object has a scroll rectangle applied.
     fn set_has_scroll_rect(&self, gc_context: &Mutation<'gc>, value: bool) {
         self.base_mut(gc_context).set_has_scroll_rect(value)
-    }
-
-    /// Called whenever the focus tracker has deemed this display object worthy, or no longer worthy,
-    /// of being the currently focused object.
-    /// This should only be called by the focus manager. To change a focus, go through that.
-    fn on_focus_changed(
-        &self,
-        _context: &mut UpdateContext<'_, 'gc>,
-        _focused: bool,
-        _other: Option<DisplayObject<'gc>>,
-    ) {
-    }
-
-    fn call_focus_handler(
-        &self,
-        context: &mut UpdateContext<'_, 'gc>,
-        focused: bool,
-        other: Option<DisplayObject<'gc>>,
-    ) {
-        if let Avm1Value::Object(object) = self.object() {
-            let other = other.map(|d| d.object()).unwrap_or(Avm1Value::Null);
-            let mut activation = Activation::from_nothing(
-                context.reborrow(),
-                Avm1ActivationIdentifier::root("[Handle Changed Focus]"),
-                (*self).into(),
-            );
-            let method_name = if focused {
-                "onSetFocus".into()
-            } else {
-                "onKillFocus".into()
-            };
-            let _ = object.call_method(
-                method_name,
-                &[other],
-                &mut activation,
-                Avm1ExecutionReason::Special,
-            );
-        } else if let Avm2Value::Object(object) = self.object2() {
-            let mut activation = Avm2Activation::from_nothing(context.reborrow());
-            let event_name = if focused {
-                "focusIn".into()
-            } else {
-                // `focusOut` is not this simple in FP,
-                // firing it might break SWFs that rely
-                // on the specific behavior
-                return;
-            };
-            let event = activation
-                .avm2()
-                .classes()
-                .focusevent
-                .construct(
-                    &mut activation,
-                    &[
-                        event_name,
-                        true.into(),
-                        false.into(),
-                        other.map(|o| o.object2()).unwrap_or(Avm2Value::Null),
-                        // Rest of the properties are not yet implemented
-                    ],
-                )
-                .expect("Event should construct!");
-
-            Avm2::dispatch_event(&mut activation.context, event, object);
-        }
-    }
-
-    /// Whether this clip may be focusable for keyboard input.
-    fn is_focusable(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
-        false
-    }
-
-    /// Whether this object is included in tab ordering.
-    fn is_tab_enabled(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
-        false
-    }
-
-    /// Used to customize tab ordering.
-    /// When not `None`, a custom ordering is used, and
-    /// objects are ordered according to this value.
-    fn tab_index(&self) -> Option<i64> {
-        None
     }
 
     /// Whether this display object has been created by ActionScript 3.
@@ -2262,7 +2216,7 @@ pub trait TDisplayObject<'gc>:
             }
             if self.swf_version() >= 11 {
                 if let Some(visible) = place_object.is_visible {
-                    self.set_visible(context.gc_context, visible);
+                    self.set_visible(context, visible);
                 }
                 if let Some(mut color) = place_object.background_color {
                     let color = if color.a > 0 {
@@ -2378,6 +2332,20 @@ pub trait TDisplayObject<'gc>:
                     break;
                 }
             } else {
+                break;
+            }
+        }
+        root
+    }
+
+    /// `avm1_root`, but disregards _lockroot
+    fn avm1_root_no_lock(&self) -> DisplayObject<'gc> {
+        let mut root = (*self).into();
+        while let Some(parent) = root.avm1_parent() {
+            if !parent.movie().is_action_script_3() {
+                root = parent;
+            } else {
+                // We've traversed upwards into a loader AVM2 movie, so break.
                 break;
             }
         }
@@ -2538,6 +2506,22 @@ pub trait TDisplayObject<'gc>:
             }
         } else {
             false
+        }
+    }
+
+    fn set_avm1_property(
+        self,
+        context: &mut UpdateContext<'_, 'gc>,
+        name: &'static str,
+        value: Avm1Value<'gc>,
+    ) {
+        if let Avm1Value::Object(object) = self.object() {
+            let mut activation = Activation::from_nothing(
+                context.reborrow(),
+                Avm1ActivationIdentifier::root("[AVM1 Property Set]"),
+                self.avm1_root(),
+            );
+            let _ = object.set(name, value, &mut activation);
         }
     }
 }

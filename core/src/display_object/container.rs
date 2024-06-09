@@ -10,7 +10,9 @@ use crate::display_object::avm1_button::Avm1Button;
 use crate::display_object::loader_display::LoaderDisplay;
 use crate::display_object::movie_clip::MovieClip;
 use crate::display_object::stage::Stage;
-use crate::display_object::{Depth, DisplayObject, TDisplayObject, TInteractiveObject};
+use crate::display_object::{
+    Depth, DisplayObject, InteractiveObject, TDisplayObject, TInteractiveObject,
+};
 use crate::string::WStr;
 use crate::tag_utils::SwfMovie;
 use gc_arena::{Collect, Mutation};
@@ -82,6 +84,11 @@ pub fn dispatch_added_to_stage_event<'gc>(
             dispatch_added_to_stage_event(grandchild, context)
         }
     }
+    if let Some(button) = child.as_avm2_button() {
+        if let Some(child) = button.get_state_child(button.state().into()) {
+            dispatch_added_to_stage_event(child, context);
+        }
+    }
 }
 
 /// Dispatch an `added` event to one object, and log any errors encountered
@@ -134,7 +141,7 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Get mutable access to the raw container.
     fn raw_container_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>>;
 
-    /// Get a child display object by it's position in the render list.
+    /// Get a child display object by its position in the render list.
     ///
     /// The `index` provided here should not be confused with the `Depth`s used
     /// to index the depth list.
@@ -142,7 +149,7 @@ pub trait TDisplayObjectContainer<'gc>:
         self.raw_container().get_id(index)
     }
 
-    /// Get a child display object by it's position in the depth list.
+    /// Get a child display object by its position in the depth list.
     ///
     /// The `Depth` provided here should not be confused with the `index`s used
     /// to index the render list.
@@ -150,7 +157,7 @@ pub trait TDisplayObjectContainer<'gc>:
         self.raw_container().get_depth(depth)
     }
 
-    /// Get a child display object by it's instance/timeline name.
+    /// Get a child display object by its instance/timeline name.
     ///
     /// The `case_sensitive` parameter determines if we should consider
     /// children with different capitalizations as being distinct names.
@@ -475,22 +482,56 @@ pub trait TDisplayObjectContainer<'gc>:
         RenderIter::from_container(self.into())
     }
 
-    fn is_tab_children(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
+    fn is_tab_children_avm1(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
         true
+    }
+
+    /// The property `tabChildren` allows changing the behavior of
+    /// tab ordering hierarchically.
+    /// When set to `false`, it excludes the whole subtree represented by
+    /// the container from tab ordering.
+    ///
+    /// _NOTE:_
+    /// According to the AS2 documentation, it should affect only automatic tab ordering.
+    /// However, that does not seem to be the case, as it also affects custom ordering.
+    fn is_tab_children(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if context.swf.is_action_script_3() {
+            self.raw_container().tab_children
+        } else {
+            self.is_tab_children_avm1(context)
+        }
+    }
+
+    fn set_tab_children(&self, context: &mut UpdateContext<'_, 'gc>, value: bool) {
+        if context.swf.is_action_script_3() {
+            self.raw_container_mut(context.gc()).tab_children = value;
+        } else {
+            let self_do: DisplayObject<'gc> = (*self).into();
+            self_do.set_avm1_property(context, "tabChildren", value.into());
+        }
     }
 
     fn fill_tab_order(
         &self,
-        tab_order: &mut Vec<DisplayObject<'gc>>,
+        tab_order: &mut Vec<InteractiveObject<'gc>>,
         context: &mut UpdateContext<'_, 'gc>,
     ) {
         if !self.is_tab_children(context) {
+            // AS3 docs say that objects with custom ordering (tabIndex set)
+            // are included even when tabChildren is false.
+            // Do not be fooled for that is untrue!
             return;
         }
 
         for child in self.iter_render_list() {
-            if child.is_tab_enabled(context) {
-                tab_order.push(child);
+            if !child.visible() {
+                // Non-visible objects and their children are excluded from tab ordering.
+                continue;
+            }
+            if let Some(child) = child.as_interactive() {
+                if child.is_tabbable(context) {
+                    tab_order.push(child);
+                }
             }
             if let Some(container) = child.as_container() {
                 container.fill_tab_order(tab_order, context);
@@ -622,6 +663,9 @@ pub struct ChildContainer<'gc> {
 
     /// The movie this ChildContainer belongs to.
     movie: Arc<SwfMovie>,
+
+    /// Specifies whether children are present in the tab ordering.
+    tab_children: bool,
 }
 
 impl<'gc> ChildContainer<'gc> {
@@ -632,6 +676,7 @@ impl<'gc> ChildContainer<'gc> {
             has_pending_removals: false,
             mouse_children: true,
             movie,
+            tab_children: true,
         }
     }
 

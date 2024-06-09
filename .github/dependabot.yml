@@ -1,9 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: "npm"
-    allow:
-      - dependency-type: "all"
-    directory: "/"
+    directory: "/web/"
     schedule:
       interval: "weekly"
     groups:
@@ -20,8 +18,6 @@ updates:
       interval: "weekly"
 
   - package-ecosystem: "cargo"
-    allow:
-      - dependency-type: "all"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -31,16 +27,15 @@ updates:
         - "winit"
         - "wgpu"
         - "naga"
-        - "naga_oil"
         - "egui*"
         - "raw-window-handle"
-      wasm-bindgen-dependencies:
+      wasm-bindgen:
         patterns:
         - "wasm-bindgen"
         - "js-sys"
         - "web-sys"
         - "wasm-bindgen-futures"
-      gradle-minor:
+      cargo-minor:
         patterns:
           - "*"
         update-types:
@@ -49,3 +44,4 @@ updates:
     ignore:
       - dependency-name: "tracing-tracy"
       - dependency-name: "tracy-client"
+      - dependency-name: "profiling"

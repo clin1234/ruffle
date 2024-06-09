@@ -79,6 +79,8 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
 }
 
 fn maybe_int_property(name: AvmString<'_>) -> DynamicKey<'_> {
+    // TODO: this should use a custom implementation, not parse()
+    // FP is much stricter here, only allowing pure natural numbers without sign or leading zeros
     if let Ok(val) = name.parse::<u32>() {
         DynamicKey::Uint(val)
     } else {
@@ -399,7 +401,7 @@ impl<'gc> ScriptObjectData<'gc> {
 
     pub fn is_sealed(&self) -> bool {
         self.instance_of()
-            .map(|cls| cls.inner_class_definition().read().is_sealed())
+            .map(|cls| cls.inner_class_definition().is_sealed())
             .unwrap_or(false)
     }
 

@@ -1,7 +1,9 @@
 //! `flash.display.DisplayObject` builtin/prototype
 
 use crate::avm2::activation::Activation;
-use crate::avm2::error::{argument_error, illegal_operation_error, make_error_2008, type_error};
+use crate::avm2::error::{
+    argument_error, illegal_operation_error, make_error_2007, make_error_2008,
+};
 use crate::avm2::filters::FilterAvm2Ext;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::parameters::ParametersExt;
@@ -23,7 +25,7 @@ pub fn display_object_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let class_name = class.inner_class_definition().read().name().local_name();
+    let class_name = class.inner_class_definition().name().local_name();
 
     return Err(Error::AvmError(argument_error(
         activation,
@@ -615,7 +617,7 @@ pub fn set_visible<'gc>(
     if let Some(dobj) = this.as_display_object() {
         let new_visible = args.get_bool(0);
 
-        dobj.set_visible(activation.context.gc_context, new_visible);
+        dobj.set_visible(&mut activation.context, new_visible);
     }
 
     Ok(Value::Undefined)
@@ -903,9 +905,6 @@ pub fn set_scroll_rect<'gc>(
                 object_to_rectangle(activation, rectangle)?,
             );
 
-            // TODO: Technically we should accept only `flash.geom.Rectangle` objects, in which case
-            // `object_to_rectangle` will be infallible. Once this happens, the following line can
-            // be moved above the `set_next_scroll_rect` call.
             dobj.set_has_scroll_rect(activation.context.gc_context, true);
         } else {
             dobj.set_has_scroll_rect(activation.context.gc_context, false);
@@ -1117,11 +1116,7 @@ pub fn set_blend_shader<'gc>(
             .get_public_property("data", activation)?
             .as_object()
         else {
-            return Err(Error::AvmError(type_error(
-                activation,
-                "Error #2007: Parameter data must be non-null.",
-                2007,
-            )?));
+            return Err(make_error_2007(activation, "data"));
         };
 
         let shader_handle = shader_data

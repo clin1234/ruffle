@@ -10,9 +10,7 @@ use crate::avm2::method::Method;
 use crate::avm2::object::Object;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
-use crate::avm2::Multiname;
 use crate::avm2::QName;
-use gc_arena::GcCell;
 
 /// Implements `global`'s instance constructor.
 pub fn instance_init<'gc>(
@@ -33,16 +31,23 @@ pub fn class_init<'gc>(
 }
 
 /// Construct `global`'s class.
-pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_class<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    object_class: Class<'gc>,
+) -> Class<'gc> {
     let mc = activation.context.gc_context;
-    Class::new(
+    let class = Class::new(
         QName::new(activation.avm2().public_namespace_base_version, "global"),
-        Some(Multiname::new(
-            activation.avm2().public_namespace_base_version,
-            "Object",
-        )),
+        Some(object_class),
         Method::from_builtin(instance_init, "<global instance initializer>", mc),
         Method::from_builtin(class_init, "<global class initializer>", mc),
         mc,
-    )
+    );
+
+    class.mark_traits_loaded(activation.context.gc_context);
+    class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
+
+    class
 }

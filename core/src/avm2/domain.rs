@@ -10,6 +10,7 @@ use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::QName;
+use crate::context::UpdateContext;
 use gc_arena::{Collect, GcCell, GcWeakCell, Mutation};
 use ruffle_wstr::WStr;
 
@@ -36,7 +37,7 @@ struct DomainData<'gc> {
 
     /// A map of all Clasess defined in this domain. Used by ClassObject
     /// to perform early interface resolution.
-    classes: PropertyMap<'gc, GcCell<'gc, Class<'gc>>>,
+    classes: PropertyMap<'gc, Class<'gc>>,
 
     /// The parent domain.
     parent: Option<Domain<'gc>>,
@@ -89,7 +90,7 @@ impl<'gc> Domain<'gc> {
         domain
     }
 
-    pub fn classes(&self) -> Ref<'_, PropertyMap<'gc, GcCell<'gc, Class<'gc>>>> {
+    pub fn classes(&self) -> Ref<'_, PropertyMap<'gc, Class<'gc>>> {
         Ref::map(self.0.read(), |r| &r.classes)
     }
 
@@ -198,7 +199,7 @@ impl<'gc> Domain<'gc> {
         Ok(None)
     }
 
-    fn get_class_inner(self, multiname: &Multiname<'gc>) -> Option<GcCell<'gc, Class<'gc>>> {
+    fn get_class_inner(self, multiname: &Multiname<'gc>) -> Option<Class<'gc>> {
         let read = self.0.read();
         if let Some(class) = read.classes.get_for_multiname(multiname).copied() {
             return Some(class);
@@ -213,20 +214,20 @@ impl<'gc> Domain<'gc> {
 
     pub fn get_class(
         self,
+        context: &mut UpdateContext<'_, 'gc>,
         multiname: &Multiname<'gc>,
-        mc: &Mutation<'gc>,
-    ) -> Option<GcCell<'gc, Class<'gc>>> {
+    ) -> Option<Class<'gc>> {
         let class = self.get_class_inner(multiname);
 
         if let Some(class) = class {
             if let Some(param) = multiname.param() {
                 if !param.is_any_name() {
-                    if let Some(resolved_param) = self.get_class(&param, mc) {
-                        return Some(Class::with_type_param(class, Some(resolved_param), mc));
+                    if let Some(resolved_param) = self.get_class(context, &param) {
+                        return Some(Class::with_type_param(context, class, Some(resolved_param)));
                     }
                     return None;
                 } else {
-                    return Some(Class::with_type_param(class, None, mc));
+                    return Some(Class::with_type_param(context, class, None));
                 }
             }
         }
@@ -262,7 +263,7 @@ impl<'gc> Domain<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: QName<'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let (name, mut script) = self.find_defining_script(activation, &name.into())?;
+        let (name, script) = self.find_defining_script(activation, &name.into())?;
         let globals = script.globals(&mut activation.context)?;
 
         globals.get_property(&name.into(), activation)
@@ -332,12 +333,7 @@ impl<'gc> Domain<'gc> {
     /// Export a class into the current application domain.
     ///
     /// This does nothing if the definition already exists in this domain or a parent.
-    pub fn export_class(
-        &self,
-        export_name: QName<'gc>,
-        class: GcCell<'gc, Class<'gc>>,
-        mc: &Mutation<'gc>,
-    ) {
+    pub fn export_class(&self, export_name: QName<'gc>, class: Class<'gc>, mc: &Mutation<'gc>) {
         if self.has_class(export_name) {
             return;
         }

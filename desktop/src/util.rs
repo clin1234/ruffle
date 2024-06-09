@@ -3,7 +3,6 @@ use anyhow::{anyhow, Error};
 use gilrs::Button;
 use rfd::FileDialog;
 use ruffle_core::events::{GamepadButton, KeyCode, TextControlCode};
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use url::Url;
 use winit::dpi::PhysicalSize;
@@ -144,6 +143,7 @@ pub fn winit_to_ruffle_key_code(event: &KeyEvent) -> KeyCode {
         Key::Named(NamedKey::Insert) => KeyCode::Insert,
         Key::Named(NamedKey::Delete) => KeyCode::Delete,
         Key::Named(NamedKey::Pause) => KeyCode::Pause,
+        Key::Named(NamedKey::NumLock) => KeyCode::NumLock,
         Key::Named(NamedKey::ScrollLock) => KeyCode::ScrollLock,
         Key::Named(NamedKey::F1) => KeyCode::F1,
         Key::Named(NamedKey::F2) => KeyCode::F2,
@@ -233,18 +233,9 @@ pub fn parse_url(path: &Path) -> Result<Url, Error> {
     }
 }
 
-pub fn url_to_readable_name(url: &Url) -> Cow<'_, str> {
-    let name = url
-        .path_segments()
-        .and_then(|segments| segments.last())
-        .unwrap_or_else(|| url.as_str());
-
-    urlencoding::decode(name).unwrap_or(Cow::Borrowed(name))
-}
-
 fn actually_pick_file(dir: Option<PathBuf>) -> Option<PathBuf> {
     let mut dialog = FileDialog::new()
-        .add_filter("Flash Files", &["swf", "spl"])
+        .add_filter("Flash Files", &["swf", "spl", "ruf"])
         .add_filter("All Files", &["*"])
         .set_title("Load a Flash File");
 

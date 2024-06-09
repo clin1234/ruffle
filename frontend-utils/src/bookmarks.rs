@@ -1,6 +1,9 @@
-use url::Url;
+mod read;
+mod write;
+pub use read::read_bookmarks;
+pub use write::BookmarksWriter;
 
-pub static INVALID_URL: &str = "invalid:///";
+use url::Url;
 
 #[derive(Debug, PartialEq)]
 pub struct Bookmark {
@@ -10,7 +13,7 @@ pub struct Bookmark {
 
 impl Bookmark {
     pub fn is_invalid(&self) -> bool {
-        self.url.as_str() == INVALID_URL
+        self.url.as_str() == crate::INVALID_URL
     }
 }
 

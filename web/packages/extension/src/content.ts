@@ -53,6 +53,7 @@ function injectScriptRaw(src: string) {
     const script = document.createElement("script");
     script.textContent = src;
     (document.head || document.documentElement).append(script);
+    script.remove();
 }
 
 /**
@@ -62,7 +63,10 @@ function injectScriptRaw(src: string) {
 function injectScriptURL(url: string): Promise<void> {
     const script = document.createElement("script");
     const promise = new Promise<void>((resolve, reject) => {
-        script.addEventListener("load", () => resolve());
+        script.addEventListener("load", function () {
+            resolve();
+            this.remove();
+        });
         script.addEventListener("error", (e) => reject(e));
     });
     script.charset = "utf-8";

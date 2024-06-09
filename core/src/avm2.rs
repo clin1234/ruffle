@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use crate::avm2::class::AllocatorFn;
 use crate::avm2::error::make_error_1107;
-use crate::avm2::function::Executable;
 use crate::avm2::globals::SystemClasses;
 use crate::avm2::method::{Method, NativeMethodImpl};
+use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
 use crate::context::{GcContext, UpdateContext};
 use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
@@ -295,12 +295,19 @@ impl<'gc> Avm2<'gc> {
         let (method, scope, _domain) = script.init();
         match method {
             Method::Native(method) => {
-                //This exists purely to check if the builtin is OK with being called with
-                //no parameters.
+                if method.resolved_signature.read().is_none() {
+                    method.resolve_signature(&mut init_activation)?;
+                }
+
+                let resolved_signature = method.resolved_signature.read();
+                let resolved_signature = resolved_signature.as_ref().unwrap();
+
+                // This exists purely to check if the builtin is OK with being called with
+                // no parameters.
                 init_activation.resolve_parameters(
                     Method::Native(method),
                     &[],
-                    &method.signature,
+                    resolved_signature,
                     None,
                 )?;
                 init_activation
@@ -562,16 +569,23 @@ impl<'gc> Avm2<'gc> {
             }
         };
 
+        let mut activation = Activation::from_domain(context.reborrow(), domain);
+        // Make sure we have the correct domain for code that tries to access it
+        // using `activation.domain()`
+        activation.set_outer(ScopeChain::new(domain));
+
         let num_scripts = abc.scripts.len();
-        let tunit = TranslationUnit::from_abc(abc, domain, name, movie, context.gc_context);
+        let tunit =
+            TranslationUnit::from_abc(abc, domain, name, movie, activation.context.gc_context);
+        tunit.load_classes(&mut activation)?;
         for i in 0..num_scripts {
-            tunit.load_script(i as u32, context)?;
+            tunit.load_script(i as u32, &mut activation)?;
         }
 
         if !flags.contains(DoAbc2Flag::LAZY_INITIALIZE) {
             for i in 0..num_scripts {
-                if let Some(mut script) = tunit.get_script(i) {
-                    script.globals(context)?;
+                if let Some(script) = tunit.get_script(i) {
+                    script.globals(&mut activation.context)?;
                 }
             }
         }
@@ -583,8 +597,13 @@ impl<'gc> Avm2<'gc> {
     }
 
     /// Pushes an executable on the call stack
-    pub fn push_call(&self, mc: &Mutation<'gc>, calling: &Executable<'gc>) {
-        self.call_stack.write(mc).push(calling)
+    pub fn push_call(
+        &self,
+        mc: &Mutation<'gc>,
+        method: Method<'gc>,
+        superclass: Option<ClassObject<'gc>>,
+    ) {
+        self.call_stack.write(mc).push(method, superclass)
     }
 
     /// Pushes script initializer (global init) on the call stack

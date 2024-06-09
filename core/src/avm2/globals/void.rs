@@ -8,7 +8,6 @@ use crate::avm2::object::Object;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::avm2::QName;
-use gc_arena::GcCell;
 
 fn void_init<'gc>(
     _activation: &mut Activation<'_, 'gc>,
@@ -20,7 +19,7 @@ fn void_init<'gc>(
     Ok(Value::Undefined)
 }
 
-pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Class<'gc>> {
+pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> Class<'gc> {
     let mc = activation.context.gc_context;
     let class = Class::new(
         QName::new(activation.avm2().public_namespace_base_version, "void"),
@@ -29,6 +28,11 @@ pub fn create_class<'gc>(activation: &mut Activation<'_, 'gc>) -> GcCell<'gc, Cl
         Method::from_builtin(void_init, "", mc),
         mc,
     );
+
+    class.mark_traits_loaded(activation.context.gc_context);
+    class
+        .init_vtable(&mut activation.context)
+        .expect("Native class's vtable should initialize");
 
     class
 }

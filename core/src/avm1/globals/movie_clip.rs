@@ -9,7 +9,7 @@ use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{self, ArrayObject, Object, ScriptObject, TObject, Value};
 use crate::backend::navigator::NavigationMethod;
 use crate::context::{GcContext, UpdateContext};
-use crate::display_object::{Bitmap, EditText, MovieClip};
+use crate::display_object::{Bitmap, EditText, MovieClip, TInteractiveObject};
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::prelude::*;
 use crate::string::AvmString;
@@ -238,7 +238,7 @@ pub fn hit_test<'gc>(
             // The docs say the point is in "Stage coordinates", but actually they are in root coordinates.
             // root can be moved via _root._x etc., so we actually have to transform from root to world space.
             let local = Point::from_pixels(x, y);
-            let point = movie_clip.avm1_root().local_to_global(local);
+            let point = movie_clip.avm1_root_no_lock().local_to_global(local);
             let ret = if shape {
                 movie_clip.hit_test_shape(
                     &mut activation.context,
@@ -898,26 +898,28 @@ fn create_text_field<'gc>(
         .cloned()
         .unwrap_or(Value::Undefined)
         .coerce_to_f64(activation)?;
+
+    // x, y, width, and height are integers here
     let x = args
         .get(2)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let y = args
         .get(3)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let width = args
         .get(4)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let height = args
         .get(5)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
 
     let text_field: DisplayObject<'gc> =
         EditText::new(&mut activation.context, movie, x, y, width, height).into();
@@ -1506,8 +1508,8 @@ fn get_bounds<'gc>(
             Some(activation.context.avm1.prototypes().object),
         );
         out.set("xMin", out_bounds.x_min.to_pixels().into(), activation)?;
-        out.set("yMin", out_bounds.y_min.to_pixels().into(), activation)?;
         out.set("xMax", out_bounds.x_max.to_pixels().into(), activation)?;
+        out.set("yMin", out_bounds.y_min.to_pixels().into(), activation)?;
         out.set("yMax", out_bounds.y_max.to_pixels().into(), activation)?;
         Ok(out.into())
     } else {
@@ -1828,8 +1830,8 @@ fn tab_index<'gc>(
     this: MovieClip<'gc>,
     _activation: &mut Activation<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Some(index) = this.tab_index_value() {
-        Ok(index.into())
+    if let Some(index) = this.as_interactive().and_then(|this| this.tab_index()) {
+        Ok(Value::Number(index as f64))
     } else {
         Ok(Value::Undefined)
     }
@@ -1840,19 +1842,18 @@ fn set_tab_index<'gc>(
     activation: &mut Activation<'_, 'gc>,
     value: Value<'gc>,
 ) -> Result<(), Error<'gc>> {
-    match value {
-        Value::Undefined | Value::Null => {
-            this.set_tab_index_value(&mut activation.context, None);
-        }
-        Value::Bool(_) | Value::Number(_) => {
-            // FIXME This coercion is not perfect, as it wraps
-            //       instead of falling back to MIN, as FP does
-            let i32_value = value.coerce_to_i32(activation)?;
-            this.set_tab_index_value(&mut activation.context, Some(i32_value));
-        }
-        _ => {
-            this.set_tab_index_value(&mut activation.context, Some(i32::MIN));
-        }
-    };
+    if let Some(this) = this.as_interactive() {
+        let value = match value {
+            Value::Undefined | Value::Null => None,
+            Value::Bool(_) | Value::Number(_) => {
+                // FIXME This coercion is not perfect, as it wraps
+                //       instead of falling back to MIN, as FP does
+                let i32_value = value.coerce_to_i32(activation)?;
+                Some(i32_value)
+            }
+            _ => Some(i32::MIN),
+        };
+        this.set_tab_index(&mut activation.context, value);
+    }
     Ok(())
 }

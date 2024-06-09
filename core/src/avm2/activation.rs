@@ -8,7 +8,7 @@ use crate::avm2::error::{
     make_error_1127, make_error_1506, make_null_or_undefined_error, make_reference_error,
     type_error, ReferenceErrorCode,
 };
-use crate::avm2::method::{BytecodeMethod, Method, ParamConfig};
+use crate::avm2::method::{BytecodeMethod, Method, ResolvedParamConfig};
 use crate::avm2::object::{
     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
     XmlListObject,
@@ -24,14 +24,13 @@ use crate::avm2::{Avm2, Error};
 use crate::context::{GcContext, UpdateContext};
 use crate::string::{AvmAtom, AvmString};
 use crate::tag_utils::SwfMovie;
-use gc_arena::{Gc, GcCell};
+use gc_arena::Gc;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::cmp::{min, Ordering};
 use std::sync::Arc;
 use swf::avm2::types::{
     Class as AbcClass, Exception, Index, Method as AbcMethod, MethodFlags as AbcMethodFlags,
-    Multiname as AbcMultiname, Namespace as AbcNamespace,
+    Namespace as AbcNamespace,
 };
 
 use super::error::make_mismatch_error;
@@ -258,7 +257,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             None
         };
 
-        Ok(Self {
+        let mut created_activation = Self {
             ip: 0,
             actions_since_timeout_check: 0,
             local_registers,
@@ -272,7 +271,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             max_stack_size: max_stack as usize,
             max_scope_size: max_scope as usize,
             context,
-        })
+        };
+
+        // Run verifier for bytecode methods
+        if let Method::Bytecode(method) = method {
+            if method.verified_info.read().is_none() {
+                method.verify(&mut created_activation)?;
+            }
+        }
+
+        Ok(created_activation)
     }
 
     /// Finds an object on either the current or outer scope of this activation by definition.
@@ -297,36 +305,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
     }
 
-    /// Resolves a definition using either the current or outer scope of this activation.
-    pub fn resolve_definition(
-        &mut self,
-        name: &Multiname<'gc>,
-    ) -> Result<Option<Value<'gc>>, Error<'gc>> {
-        let outer_scope = self.outer;
-
-        if let Some(obj) = search_scope_stack(self.scope_frame(), name, outer_scope.is_empty())? {
-            Ok(Some(obj.get_property(name, self)?))
-        } else if let Some(result) = outer_scope.resolve(name, self)? {
-            Ok(Some(result))
-        } else if let Some(global) = self.global_scope() {
-            if !global.base().has_own_property(name) {
-                return Ok(None);
-            }
-            return Ok(Some(global.base().get_property_local(name, self)?));
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn lookup_class_in_domain(
-        &mut self,
-        name: &Multiname<'gc>,
-    ) -> Result<GcCell<'gc, Class<'gc>>, Error<'gc>> {
-        self.domain()
-            .get_class(name, self.context.gc_context)
-            .ok_or_else(|| format!("Attempted to resolve nonexistent type {name:?}").into())
-    }
-
     /// Resolve a single parameter value.
     ///
     /// Given an individual parameter value and the associated parameter's
@@ -337,15 +315,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         method: Method<'gc>,
         value: Option<&Value<'gc>>,
-        param_config: &ParamConfig<'gc>,
+        param_config: &ResolvedParamConfig<'gc>,
         user_arguments: &[Value<'gc>],
         callee: Option<Object<'gc>>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let arg = if let Some(value) = value {
-            Cow::Borrowed(value)
-        } else if let Some(default) = &param_config.default_value {
-            Cow::Borrowed(default)
-        } else if param_config.param_type_name.is_any_name() {
+            value
+        } else if let Some(default_value) = &param_config.default_value {
+            default_value
+        } else if param_config.param_type.is_none() {
+            // TODO: FP's system of allowing missing arguments
+            // is a more complicated than this.
             return Ok(Value::Undefined);
         } else {
             return Err(Error::AvmError(make_mismatch_error(
@@ -356,7 +336,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             )?));
         };
 
-        arg.coerce_to_type_name(self, &param_config.param_type_name)
+        if let Some(param_class) = param_config.param_type {
+            arg.coerce_to_type(self, param_class)
+        } else {
+            Ok(*arg)
+        }
     }
 
     /// Statically resolve all of the parameters for a given method.
@@ -370,7 +354,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         method: Method<'gc>,
         user_arguments: &[Value<'gc>],
-        signature: &[ParamConfig<'gc>],
+        signature: &[ResolvedParamConfig<'gc>],
         callee: Option<Object<'gc>>,
     ) -> Result<Vec<Value<'gc>>, Error<'gc>> {
         let mut arguments_list = Vec::new();
@@ -426,13 +410,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let body = body?;
         let num_locals = body.num_locals;
         let has_rest_or_args = method.is_variadic();
-        let arg_register = if has_rest_or_args { 1 } else { 0 };
-        let signature: &[ParamConfig<'_>] = method.signature();
 
-        let num_declared_arguments = signature.len() as u32;
-
-        let mut local_registers =
-            RegisterSet::new(num_locals + num_declared_arguments + arg_register + 1);
+        let mut local_registers = RegisterSet::new(num_locals + 1);
         *local_registers.get_unchecked_mut(0) = this.into();
 
         let activation_class =
@@ -463,6 +442,14 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.scope_depth = self.context.avm2.scope_stack.len();
         self.max_stack_size = body.max_stack as usize;
         self.max_scope_size = (body.max_scope_depth - body.init_scope_depth) as usize;
+
+        // Everything is now setup for the verifier to run
+        if method.verified_info.read().is_none() {
+            method.verify(self)?;
+        }
+
+        let verified_info = method.verified_info.read();
+        let signature = &verified_info.as_ref().unwrap().param_config;
 
         if user_arguments.len() > signature.len() && !has_rest_or_args {
             return Err(Error::AvmError(make_mismatch_error(
@@ -525,7 +512,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
             *self
                 .local_registers
-                .get_unchecked_mut(1 + num_declared_arguments) = args_object.into();
+                .get_unchecked_mut(1 + signature.len() as u32) = args_object.into();
         }
 
         Ok(())
@@ -754,24 +741,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             .pool_namespace(index, &mut self.context)
     }
 
-    /// Retrieve a multiname from the current constant pool.
-    /// The name is guaranteed to be fully initialized.
-    fn pool_multiname_and_initialize(
-        &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
-    ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
-        let name = method
-            .translation_unit()
-            .pool_maybe_uninitialized_multiname(index, &mut self.context)?;
-        if name.has_lazy_component() {
-            let name = name.fill_with_runtime_params(self)?;
-            Ok(Gc::new(self.context.gc_context, name))
-        } else {
-            Ok(name)
-        }
-    }
-
     /// Retrieve a method entry from the current ABC file's method table.
     fn table_method(
         &mut self,
@@ -789,7 +758,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         method: Gc<'gc, BytecodeMethod<'gc>>,
         index: Index<AbcClass>,
-    ) -> Result<GcCell<'gc, Class<'gc>>, Error<'gc>> {
+    ) -> Result<Class<'gc>, Error<'gc>> {
         method.translation_unit().load_class(index.0, self)
     }
 
@@ -797,16 +766,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         method: Gc<'gc, BytecodeMethod<'gc>>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if method.verified_info.read().is_none() {
-            method.verify(self)?;
-        }
+        // The method must be verified at this point
 
         let verified_info = method.verified_info.read();
         let verified_code = verified_info.as_ref().unwrap().parsed_code.as_slice();
-
-        if verified_code.is_empty() {
-            return Ok(Value::Undefined);
-        }
 
         self.ip = 0;
 
@@ -911,14 +874,19 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::SetLocal { index } => self.op_set_local(*index),
                 Op::Kill { index } => self.op_kill(*index),
                 Op::Call { num_args } => self.op_call(*num_args),
-                Op::CallMethod { index, num_args } => self.op_call_method(*index, *num_args),
+                Op::CallMethod {
+                    index,
+                    num_args,
+                    push_return_value,
+                } => self.op_call_method(*index, *num_args, *push_return_value),
                 Op::CallProperty {
                     multiname,
                     num_args,
                 } => self.op_call_property(*multiname, *num_args),
-                Op::CallPropLex { index, num_args } => {
-                    self.op_call_prop_lex(method, *index, *num_args)
-                }
+                Op::CallPropLex {
+                    multiname,
+                    num_args,
+                } => self.op_call_prop_lex(*multiname, *num_args),
                 Op::CallPropVoid {
                     multiname,
                     num_args,
@@ -926,18 +894,23 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::CallStatic { index, num_args } => {
                     self.op_call_static(method, *index, *num_args)
                 }
-                Op::CallSuper { index, num_args } => self.op_call_super(method, *index, *num_args),
-                Op::CallSuperVoid { index, num_args } => {
-                    self.op_call_super_void(method, *index, *num_args)
-                }
+                Op::CallSuper {
+                    multiname,
+                    num_args,
+                } => self.op_call_super(*multiname, *num_args),
+                Op::CallSuperVoid {
+                    multiname,
+                    num_args,
+                } => self.op_call_super_void(*multiname, *num_args),
                 Op::ReturnValue => self.op_return_value(method),
+                Op::ReturnValueNoCoerce => self.op_return_value_no_coerce(),
                 Op::ReturnVoid => self.op_return_void(),
                 Op::GetProperty { multiname } => self.op_get_property(*multiname),
                 Op::SetProperty { multiname } => self.op_set_property(*multiname),
                 Op::InitProperty { multiname } => self.op_init_property(*multiname),
                 Op::DeleteProperty { multiname } => self.op_delete_property(*multiname),
-                Op::GetSuper { index } => self.op_get_super(method, *index),
-                Op::SetSuper { index } => self.op_set_super(method, *index),
+                Op::GetSuper { multiname } => self.op_get_super(*multiname),
+                Op::SetSuper { multiname } => self.op_set_super(*multiname),
                 Op::In => self.op_in(),
                 Op::PushScope => self.op_push_scope(),
                 Op::NewCatch { index } => self.op_newcatch(method, *index),
@@ -949,10 +922,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::FindDef { multiname } => self.op_find_def(*multiname),
                 Op::FindProperty { multiname } => self.op_find_property(*multiname),
                 Op::FindPropStrict { multiname } => self.op_find_prop_strict(*multiname),
-                Op::GetLex { multiname } => self.op_get_lex(*multiname),
-                Op::GetDescendants { index } => self.op_get_descendants(method, *index),
+                Op::GetScriptGlobals { script } => self.op_get_script_globals(*script),
+                Op::GetDescendants { multiname } => self.op_get_descendants(*multiname),
                 Op::GetSlot { index } => self.op_get_slot(*index),
                 Op::SetSlot { index } => self.op_set_slot(*index),
+                Op::SetSlotNoCoerce { index } => self.op_set_slot_no_coerce(*index),
                 Op::GetGlobalSlot { index } => self.op_get_global_slot(*index),
                 Op::SetGlobalSlot { index } => self.op_set_global_slot(*index),
                 Op::Construct { num_args } => self.op_construct(*num_args),
@@ -1205,6 +1179,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         index: u32,
         arg_count: u32,
+        push_return_value: bool,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         // The entire implementation of VTable assumes that
         // call_method is never encountered in user code. (see the long comment there)
@@ -1218,7 +1193,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let value = receiver.call_method(index, &args, self)?;
 
-        self.push_stack(value);
+        if push_return_value {
+            self.push_stack(value);
+        }
 
         Ok(FrameControl::Continue)
     }
@@ -1243,12 +1220,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_call_prop_lex(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         let args = self.pop_stack_args(arg_count);
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self
             .pop_stack()
             .coerce_to_object_or_typeerror(self, Some(&multiname))?;
@@ -1302,12 +1278,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_call_super(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         let args = self.pop_stack_args(arg_count);
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self
             .pop_stack()
             .coerce_to_object_or_typeerror(self, Some(&multiname))?;
@@ -1323,12 +1298,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_call_super_void(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         let args = self.pop_stack_args(arg_count);
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self
             .pop_stack()
             .coerce_to_object_or_typeerror(self, Some(&multiname))?;
@@ -1345,8 +1319,21 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         method: Gc<'gc, BytecodeMethod<'gc>>,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         let return_value = self.pop_stack();
-        let coerced = return_value.coerce_to_type_name(self, &method.return_type)?;
+        let return_type = method.resolved_return_type();
+
+        let coerced = if let Some(return_type) = return_type {
+            return_value.coerce_to_type(self, return_type)?
+        } else {
+            return_value
+        };
+
         Ok(FrameControl::Return(coerced))
+    }
+
+    fn op_return_value_no_coerce(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let return_value = self.pop_stack();
+
+        Ok(FrameControl::Return(return_value))
     }
 
     fn op_return_void(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
@@ -1367,6 +1354,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         // (fast) side path for dictionary/array-likes
+        // NOTE: FP behaves differently here when the public namespace isn't
+        // included in the multiname's namespace set
         if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
             // `MultinameL` is the only form of multiname that allows fast-path
             // or alternate-path lookups based on the local name *value*,
@@ -1426,25 +1415,43 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         // side path for dictionary/arrays (TODO)
+        // NOTE: FP behaves differently here when the public namespace isn't
+        // included in the multiname's namespace set
         if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
             // `MultinameL` is the only form of multiname that allows fast-path
             // or alternate-path lookups based on the local name *value*,
             // rather than it's string representation.
 
             let name_value = self.context.avm2.peek(0);
-            let object = self.context.avm2.peek(1);
-            if !name_value.is_primitive() {
-                let object = object.coerce_to_object_or_typeerror(self, None)?;
-                if let Some(dictionary) = object.as_dictionary_object() {
-                    let _ = self.pop_stack();
-                    let _ = self.pop_stack();
-                    dictionary.set_property_by_object(
-                        name_value.as_object().unwrap(),
-                        value,
-                        self.context.gc_context,
-                    );
+            let object_value = self.context.avm2.peek(1);
 
-                    return Ok(FrameControl::Continue);
+            if let Value::Object(object) = object_value {
+                match name_value {
+                    Value::Integer(name_int) if name_int >= 0 => {
+                        if let Some(mut array) =
+                            object.as_array_storage_mut(self.context.gc_context)
+                        {
+                            let _ = self.pop_stack();
+                            let _ = self.pop_stack();
+                            array.set(name_int as usize, value);
+
+                            return Ok(FrameControl::Continue);
+                        }
+                    }
+                    Value::Object(name_object) => {
+                        if let Some(dictionary) = object.as_dictionary_object() {
+                            let _ = self.pop_stack();
+                            let _ = self.pop_stack();
+                            dictionary.set_property_by_object(
+                                name_object,
+                                value,
+                                self.context.gc_context,
+                            );
+
+                            return Ok(FrameControl::Continue);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1525,10 +1532,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_get_super(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let object = self
             .pop_stack()
             .coerce_to_object_or_typeerror(self, Some(&multiname))?;
@@ -1544,11 +1550,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_set_super(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         let value = self.pop_stack();
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let object = self
             .pop_stack()
             .coerce_to_object_or_typeerror(self, Some(&multiname))?;
@@ -1663,7 +1668,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         // Verifier ensures that multiname is non-lazy
 
         avm_debug!(self.avm2(), "Resolving {:?}", *multiname);
-        let (_, mut script) = self.domain().find_defining_script(self, &multiname)?;
+        let (_, script) = self.domain().find_defining_script(self, &multiname)?;
         let obj = script.globals(&mut self.context)?;
         self.push_stack(obj);
         Ok(FrameControl::Continue)
@@ -1703,12 +1708,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
+    fn op_get_script_globals(
+        &mut self,
+        script: Script<'gc>,
+    ) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let globals = script.globals(&mut self.context)?;
+
+        self.push_stack(globals);
+
+        Ok(FrameControl::Continue)
+    }
+
     fn op_get_descendants(
         &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
-        let multiname = self.pool_multiname_and_initialize(method, index)?;
+        let multiname = multiname.fill_with_runtime_params(self)?;
         let object = self.pop_stack().coerce_to_object_or_typeerror(self, None)?;
         if let Some(descendants) = object.xml_descendants(self, &multiname) {
             self.push_stack(descendants);
@@ -1718,7 +1733,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 .instance_of()
                 .map(|cls| {
                     cls.inner_class_definition()
-                        .read()
                         .name()
                         .to_qualified_name_err_message(self.context.gc_context)
                 })
@@ -1732,23 +1746,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 1016,
             )?));
         }
-
-        Ok(FrameControl::Continue)
-    }
-
-    fn op_get_lex(
-        &mut self,
-        multiname: Gc<'gc, Multiname<'gc>>,
-    ) -> Result<FrameControl<'gc>, Error<'gc>> {
-        // Verifier ensures that multiname is non-lazy
-
-        avm_debug!(self.avm2(), "Resolving {:?}", *multiname);
-        let found: Result<Value<'gc>, Error<'gc>> =
-            self.resolve_definition(&multiname)?.ok_or_else(|| {
-                make_reference_error(self, ReferenceErrorCode::InvalidLookup, &multiname, None)
-            });
-
-        self.push_stack(found?);
 
         Ok(FrameControl::Continue)
     }
@@ -1767,6 +1764,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let object = self.pop_stack().coerce_to_object_or_typeerror(self, None)?;
 
         object.set_slot(index, value, self)?;
+
+        Ok(FrameControl::Continue)
+    }
+
+    fn op_set_slot_no_coerce(&mut self, index: u32) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let value = self.pop_stack();
+        let object = self.pop_stack().coerce_to_object_or_typeerror(self, None)?;
+
+        object.set_slot_no_coerce(index, value, self.context.gc_context)?;
 
         Ok(FrameControl::Continue)
     }
@@ -2021,7 +2027,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        // TODO: Special handling required for `Date` and ECMA-357/E4X `XML`
         let sum_value = match (value1, value2) {
             // note: with not-yet-guaranteed assumption that Integer < 1<<28, this won't overflow.
             (Value::Integer(n1), Value::Integer(n2)) => (n1 + n2).into(),
@@ -2607,10 +2612,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
-    fn op_is_type(
-        &mut self,
-        class: GcCell<'gc, Class<'gc>>,
-    ) -> Result<FrameControl<'gc>, Error<'gc>> {
+    fn op_is_type(&mut self, class: Class<'gc>) -> Result<FrameControl<'gc>, Error<'gc>> {
         let value = self.pop_stack();
 
         let is_instance_of = value.is_of_type(self, class);
@@ -2639,10 +2641,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
-    fn op_as_type(
-        &mut self,
-        class: GcCell<'gc, Class<'gc>>,
-    ) -> Result<FrameControl<'gc>, Error<'gc>> {
+    fn op_as_type(&mut self, class: Class<'gc>) -> Result<FrameControl<'gc>, Error<'gc>> {
         let value = self.pop_stack();
 
         if value.is_of_type(self, class) {
@@ -2808,10 +2807,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     /// Implements `Op::Coerce`
-    fn op_coerce(
-        &mut self,
-        class: GcCell<'gc, Class<'gc>>,
-    ) -> Result<FrameControl<'gc>, Error<'gc>> {
+    fn op_coerce(&mut self, class: Class<'gc>) -> Result<FrameControl<'gc>, Error<'gc>> {
         let val = self.pop_stack();
         let x = val.coerce_to_type(self, class)?;
 
@@ -2835,7 +2831,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let dm = self.domain_memory();
         let mut dm = dm
             .as_bytearray_mut(self.context.gc_context)
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+            .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
             return Err(make_error_1506(self));
@@ -2845,8 +2841,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Err(make_error_1506(self));
         }
 
-        dm.write_at_nongrowing(&val.to_le_bytes(), address)
-            .map_err(|e| e.to_avm(self))?;
+        dm.set_nongrowing(address, val as u8);
 
         Ok(FrameControl::Continue)
     }
@@ -2859,7 +2854,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let dm = self.domain_memory();
         let mut dm = dm
             .as_bytearray_mut(self.context.gc_context)
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+            .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
             return Err(make_error_1506(self));
@@ -2881,7 +2876,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let dm = self.domain_memory();
         let mut dm = dm
             .as_bytearray_mut(self.context.gc_context)
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+            .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
             return Err(make_error_1506(self));
@@ -2903,7 +2898,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let dm = self.domain_memory();
         let mut dm = dm
             .as_bytearray_mut(self.context.gc_context)
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+            .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
             return Err(make_error_1506(self));
@@ -2925,7 +2920,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let dm = self.domain_memory();
         let mut dm = dm
             .as_bytearray_mut(self.context.gc_context)
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+            .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
             return Err(make_error_1506(self));
@@ -2944,9 +2939,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let address = self.pop_stack().coerce_to_u32(self)? as usize;
 
         let dm = self.domain_memory();
-        let dm = dm
-            .as_bytearray()
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+        let dm = dm.as_bytearray().expect("Bytearray storage should exist");
+
         let val = dm.get(address);
 
         if let Some(val) = val {
@@ -2963,9 +2957,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let address = self.pop_stack().coerce_to_u32(self)? as usize;
 
         let dm = self.domain_memory();
-        let dm = dm
-            .as_bytearray()
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+        let dm = dm.as_bytearray().expect("Bytearray storage should exist");
 
         if address > dm.len() - 2 {
             return Err(make_error_1506(self));
@@ -2982,9 +2974,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let address = self.pop_stack().coerce_to_u32(self)? as usize;
 
         let dm = self.domain_memory();
-        let dm = dm
-            .as_bytearray()
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+        let dm = dm.as_bytearray().expect("Bytearray storage should exist");
 
         if address > dm.len() - 4 {
             return Err(make_error_1506(self));
@@ -3000,9 +2990,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let address = self.pop_stack().coerce_to_u32(self)? as usize;
 
         let dm = self.domain_memory();
-        let dm = dm
-            .as_bytearray()
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+        let dm = dm.as_bytearray().expect("Bytearray storage should exist");
 
         if address > dm.len() - 4 {
             return Err(make_error_1506(self));
@@ -3019,9 +3007,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let address = self.pop_stack().coerce_to_u32(self)? as usize;
 
         let dm = self.domain_memory();
-        let dm = dm
-            .as_bytearray()
-            .ok_or_else(|| "Unable to get bytearray storage".to_string())?;
+        let dm = dm.as_bytearray().expect("Bytearray storage should exist");
 
         if address > dm.len() - 8 {
             return Err(make_error_1506(self));

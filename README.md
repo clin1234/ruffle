@@ -62,7 +62,6 @@ The following are typical dependencies for Linux:
 * libxcb-shape0-dev
 * libxcb-xfixes0-dev
 * libgtk-3-dev
-* libssl-dev
 * libudev-dev
 * libxcb-xinput-dev
 * libxcb-xkb-dev
@@ -110,7 +109,7 @@ If you have a collection of "real world" SWFs to test against, the scanner may b
 ruffle's parsing capabilities. Provided with a folder and an output filename, it will attempt to read
 all of the Flash files and report on the success of such a task.
 
-`cargo run --release --package=ruffle_scanner -- folder/with/swfs/ results.csv`
+`cargo run --release --package=ruffle_scanner -- scan folder/with/swfs/ results.csv`
 
 ### Exporter
 

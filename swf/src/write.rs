@@ -562,7 +562,7 @@ impl<W: Write> Writer<W> {
                 if let BitmapFormat::ColorMap8 { num_colors } = tag.format {
                     self.write_u8(num_colors)?;
                 }
-                self.output.write_all(tag.data)?;
+                self.output.write_all(&tag.data)?;
             }
 
             Tag::DefineButton(ref button) => self.write_define_button(button)?,
@@ -1849,10 +1849,10 @@ impl<W: Write> Writer<W> {
     fn write_convolution_filter(&mut self, filter: &ConvolutionFilter) -> Result<()> {
         self.write_u8(filter.num_matrix_cols)?;
         self.write_u8(filter.num_matrix_rows)?;
-        self.write_fixed16(filter.divisor)?;
-        self.write_fixed16(filter.bias)?;
+        self.write_f32(filter.divisor)?;
+        self.write_f32(filter.bias)?;
         for val in &filter.matrix {
-            self.write_fixed16(*val)?;
+            self.write_f32(*val)?;
         }
         self.write_rgba(&filter.default_color)?;
         self.write_u8(filter.flags.bits())?;
@@ -2434,7 +2434,6 @@ fn count_fbits(n: Fixed16) -> u32 {
 #[cfg(test)]
 #[allow(clippy::unusual_byte_groupings)]
 mod tests {
-    use super::Writer;
     use super::*;
     use crate::test_data;
 

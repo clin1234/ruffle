@@ -72,6 +72,10 @@ pub enum FramePhase {
 pub fn run_all_phases_avm2(context: &mut UpdateContext<'_, '_>) {
     let stage = context.stage;
 
+    if !stage.movie().is_action_script_3() {
+        return;
+    }
+
     *context.frame_phase = FramePhase::Enter;
     Avm2::each_orphan_obj(context, |orphan, context| {
         orphan.enter_frame(context);
@@ -120,7 +124,7 @@ pub fn run_inner_goto_frame<'gc>(
     removed_frame_scripts: &[DisplayObject<'gc>],
     initial_clip: MovieClip<'gc>,
 ) {
-    if initial_clip.swf_version() <= 9 {
+    if initial_clip.swf_version() <= 9 && initial_clip.movie().is_action_script_3() {
         avm2_stub_method_context!(
             context,
             "flash.display.MovieClip",
@@ -188,7 +192,7 @@ pub fn catchup_display_object_to_frame<'gc>(
     context: &mut UpdateContext<'_, 'gc>,
     dobj: DisplayObject<'gc>,
 ) {
-    if !context.is_action_script_3() {
+    if !dobj.movie().is_action_script_3() {
         return;
     }
 

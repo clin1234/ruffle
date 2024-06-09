@@ -1,5 +1,3 @@
-// This is a new lint with false positives, see https://github.com/rust-lang/rust-clippy/issues/10318
-#![allow(clippy::extra_unused_type_parameters)]
 // This lint is helpful, but right now we have too many instances of it.
 // TODO: Remove this once all instances are fixed.
 #![allow(clippy::needless_pass_by_ref_mut)]
@@ -31,7 +29,6 @@ pub mod context;
 pub mod context_menu;
 mod drawing;
 mod ecma_conversions;
-pub(crate) mod either;
 pub mod events;
 pub mod focus_tracker;
 mod font;
@@ -40,6 +37,7 @@ mod html;
 mod library;
 pub mod limits;
 pub mod loader;
+mod local_connection;
 mod locale;
 mod net_connection;
 pub mod pixel_bender;

@@ -9,10 +9,10 @@ use crate::avm2::object::{Object, TObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 use crate::avm2::{ArrayObject, ArrayStorage, Error};
+use crate::avm2_stub_method;
 use crate::context::UpdateContext;
 use crate::display_object::HitTestOptions;
 use crate::display_object::{DisplayObject, TDisplayObject, TDisplayObjectContainer};
-use crate::{avm2_stub_getter, avm2_stub_method, avm2_stub_setter};
 use std::cmp::min;
 
 /// Implements `flash.display.DisplayObjectContainer`'s native instance constructor.
@@ -47,6 +47,14 @@ fn validate_add_operation<'gc>(
             activation,
             "Error #3783: A Stage object cannot be added as the child of another object.",
             3783,
+        )?));
+    }
+
+    if !proposed_child.movie().is_action_script_3() {
+        return Err(Error::AvmError(argument_error(
+            activation,
+            "Error #2180: It is illegal to move AVM1 content (AS1 or AS2) to a different part of the displayList when it has been loaded into AVM2 (AS3) content.",
+            2180,
         )?));
     }
 
@@ -629,28 +637,31 @@ pub fn set_mouse_children<'gc>(
 
 pub fn get_tab_children<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
+    this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(
-        activation,
-        "flash.display.DisplayObjectContainer",
-        "tabChildren"
-    );
-
-    Ok(true.into())
+    if let Some(obj) = this
+        .as_display_object()
+        .and_then(|this| this.as_container())
+    {
+        Ok(Value::Bool(obj.is_tab_children(&mut activation.context)))
+    } else {
+        Ok(Value::Undefined)
+    }
 }
 
 pub fn set_tab_children<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
-    _args: &[Value<'gc>],
+    this: Object<'gc>,
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_setter!(
-        activation,
-        "flash.display.DisplayObjectContainer",
-        "tabChildren"
-    );
+    if let Some(obj) = this
+        .as_display_object()
+        .and_then(|this| this.as_container())
+    {
+        let value = args.get_bool(0);
+        obj.set_tab_children(&mut activation.context, value);
+    }
 
     Ok(Value::Undefined)
 }

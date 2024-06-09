@@ -6,6 +6,7 @@ import {
     LogLevel,
     OpenURLMode,
     NetworkingAccessMode,
+    PlayerRuntime,
     UnmuteOverlay,
     WindowMode,
 } from "./load-options";
@@ -30,6 +31,7 @@ export const DEFAULT_CONFIG: Required<BaseLoadOptions> = {
     maxExecutionDuration: 15,
     base: null,
     menu: true,
+    allowFullscreen: false,
     salign: "",
     forceAlign: false,
     quality: "high",
@@ -48,4 +50,5 @@ export const DEFAULT_CONFIG: Required<BaseLoadOptions> = {
     fontSources: [],
     defaultFonts: {},
     credentialAllowList: [],
+    playerRuntime: PlayerRuntime.FlashPlayer,
 };

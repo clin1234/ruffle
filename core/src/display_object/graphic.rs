@@ -3,7 +3,7 @@ use crate::avm2::{
     Activation as Avm2Activation, Object as Avm2Object, StageObject as Avm2StageObject,
 };
 use crate::context::{RenderContext, UpdateContext};
-use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
+use crate::display_object::{DisplayObjectBase, DisplayObjectPtr};
 use crate::drawing::Drawing;
 use crate::library::MovieLibrarySource;
 use crate::prelude::*;
@@ -49,13 +49,11 @@ impl<'gc> Graphic<'gc> {
         let static_data = GraphicStatic {
             id: swf_shape.id,
             bounds: swf_shape.shape_bounds.clone(),
-            render_handle: Some(context.renderer.register_shape(
-                (&swf_shape).into(),
-                &MovieLibrarySource {
-                    library,
-                    gc_context: context.gc_context,
-                },
-            )),
+            render_handle: Some(
+                context
+                    .renderer
+                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
+            ),
             shape: swf_shape,
             movie,
         };
@@ -141,7 +139,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
     }
 
     fn construct_frame(&self, context: &mut UpdateContext<'_, 'gc>) {
-        if context.is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
+        if self.movie().is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
             let shape_constr = context.avm2.classes().shape;
             let mut activation = Avm2Activation::from_nothing(context.reborrow());
 
@@ -230,7 +228,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
         _instantiated_by: Instantiator,
         run_frame: bool,
     ) {
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             self.set_default_instance_name(context);
         } else {
             context

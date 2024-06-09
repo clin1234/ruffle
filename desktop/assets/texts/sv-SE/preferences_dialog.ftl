@@ -1,0 +1,16 @@
+preferences-dialog = Ruffle-preferenser
+preference-locked-by-cli = Endast läsbar (sätt av CLI:n)
+graphics-backend = Grafik-backend
+graphics-backend-default = Standard
+graphics-power = Energialternativ
+graphics-power-low = Låg (t.ex. iGPU)
+graphics-power-high = Hög (t.ex. GPU)
+language = Språk
+audio-output-device = Ljudutgångsenhet
+audio-output-device-default = Systemstandard
+log-filename-pattern = Loggfilnamn
+log-filename-pattern-single-file = Enskild Fil (ruffle.log)
+log-filename-pattern-with-timestamp = Med Tidsstämpel
+storage-backend = Sparfilplats
+storage-backend-disk = Disk
+storage-backend-memory = Minne

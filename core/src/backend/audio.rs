@@ -7,7 +7,7 @@ use crate::{
 };
 use downcast_rs::Downcast;
 use gc_arena::Collect;
-use generational_arena::{Arena, Index};
+use slotmap::{new_key_type, Key, SlotMap};
 
 #[cfg(feature = "audio")]
 pub mod decoders;
@@ -35,8 +35,11 @@ mod decoders {
 use thiserror::Error;
 use web_time::Duration;
 
-pub type SoundHandle = Index;
-pub type SoundInstanceHandle = Index;
+new_key_type! {
+    pub struct SoundHandle;
+    pub struct SoundInstanceHandle;
+}
+
 pub type DecodeError = decoders::Error;
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -134,11 +137,11 @@ pub trait AudioBackend: Downcast {
     fn stop_all_sounds(&mut self);
 
     /// Get the position of a sound instance in milliseconds.
-    /// Returns `None` if ther sound is not/no longer playing
+    /// Returns `None` if the sound is not/no longer playing
     fn get_sound_position(&self, instance: SoundInstanceHandle) -> Option<f64>;
 
     /// Get the duration of a sound in milliseconds.
-    /// Returns `None` if sound is not registered.
+    /// Returns `None` if the sound is not registered.
     fn get_sound_duration(&self, sound: SoundHandle) -> Option<f64>;
 
     /// Get the size of the data stored within a given sound.
@@ -205,14 +208,14 @@ struct NullSound {
 
 /// Audio backend that ignores all audio.
 pub struct NullAudioBackend {
-    sounds: Arena<NullSound>,
+    sounds: SlotMap<SoundHandle, NullSound>,
     volume: f32,
 }
 
 impl NullAudioBackend {
     pub fn new() -> NullAudioBackend {
         NullAudioBackend {
-            sounds: Arena::new(),
+            sounds: SlotMap::with_key(),
             volume: 1.0,
         }
     }
@@ -259,7 +262,7 @@ impl AudioBackend for NullAudioBackend {
         _sound: SoundHandle,
         _sound_info: &swf::SoundInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        Ok(SoundInstanceHandle::from_raw_parts(0, 0))
+        Ok(SoundInstanceHandle::null())
     }
 
     fn start_stream(
@@ -267,7 +270,7 @@ impl AudioBackend for NullAudioBackend {
         _clip_data: crate::tag_utils::SwfSlice,
         _handle: &swf::SoundStreamHead,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        Ok(SoundInstanceHandle::from_raw_parts(0, 0))
+        Ok(SoundInstanceHandle::null())
     }
 
     fn start_substream(
@@ -275,7 +278,7 @@ impl AudioBackend for NullAudioBackend {
         _stream_data: Substream,
         _handle: &SoundStreamInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        Ok(SoundInstanceHandle::from_raw_parts(0, 0))
+        Ok(SoundInstanceHandle::null())
     }
 
     fn stop_sound(&mut self, _sound: SoundInstanceHandle) {}
@@ -359,7 +362,7 @@ impl<'gc> AudioManager<'gc> {
     /// The threshold in seconds where an audio stream is considered too out-of-sync and will be stopped.
     pub const STREAM_RESTART_THRESHOLD: f64 = 1.0;
 
-    /// The minimum audio sycning threshold in seconds.
+    /// The minimum audio syncing threshold in seconds.
     ///
     /// The player will adjust animation speed to stay within this many seconds of the audio track.
     pub const STREAM_DEFAULT_SYNC_THRESHOLD: f64 = 0.2;
@@ -515,11 +518,11 @@ impl<'gc> AudioManager<'gc> {
         audio.stop_all_sounds();
     }
 
-    pub fn is_sound_playing(&mut self, sound: SoundInstanceHandle) -> bool {
+    pub fn is_sound_playing(&self, sound: SoundInstanceHandle) -> bool {
         self.sounds.iter().any(|other| other.instance == sound)
     }
 
-    pub fn is_sound_playing_with_handle(&mut self, sound: SoundHandle) -> bool {
+    pub fn is_sound_playing_with_handle(&self, sound: SoundHandle) -> bool {
         self.sounds.iter().any(|other| other.sound == Some(sound))
     }
 

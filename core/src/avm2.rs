@@ -3,14 +3,16 @@
 use std::rc::Rc;
 
 use crate::avm2::class::AllocatorFn;
-use crate::avm2::function::Executable;
+use crate::avm2::error::make_error_1107;
 use crate::avm2::globals::SystemClasses;
 use crate::avm2::method::{Method, NativeMethodImpl};
+use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
 use crate::context::{GcContext, UpdateContext};
 use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
+use crate::PlayerRuntime;
 
 use fnv::FnvHashMap;
 use gc_arena::{Collect, GcCell, Mutation};
@@ -48,6 +50,8 @@ mod method;
 mod multiname;
 mod namespace;
 pub mod object;
+mod op;
+mod optimize;
 mod parameters;
 pub mod property;
 mod property_map;
@@ -55,17 +59,21 @@ mod qname;
 mod regexp;
 mod scope;
 mod script;
+#[cfg(feature = "known_stubs")]
+pub mod specification;
 mod string;
 mod stubs;
 mod traits;
 mod value;
 pub mod vector;
+mod verify;
 mod vtable;
 
 pub use crate::avm2::activation::Activation;
 pub use crate::avm2::array::ArrayStorage;
 pub use crate::avm2::call_stack::{CallNode, CallStack};
-pub use crate::avm2::domain::Domain;
+#[allow(unused)] // For debug_ui
+pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;
 pub use crate::avm2::flv::FlvValueAvm2Ext;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
@@ -91,6 +99,10 @@ const BROADCAST_WHITELIST: [&str; 4] = ["enterFrame", "exitFrame", "frameConstru
 pub struct Avm2<'gc> {
     /// The Flash Player version we're emulating.
     player_version: u8,
+
+    /// The player runtime we're emulating
+    #[collect(require_static)]
+    pub player_runtime: PlayerRuntime,
 
     /// Values currently present on the operand stack.
     stack: Vec<Value<'gc>>,
@@ -148,7 +160,7 @@ pub struct Avm2<'gc> {
     #[collect(require_static)]
     native_call_handler_table: &'static [Option<(&'static str, NativeMethodImpl)>],
 
-    /// A list of objects which are capable of recieving broadcasts.
+    /// A list of objects which are capable of receiving broadcasts.
     ///
     /// Certain types of events are "broadcast events" that are emitted on all
     /// constructed objects in order of their creation, whether or not they are
@@ -176,11 +188,17 @@ pub struct Avm2<'gc> {
 
     #[cfg(feature = "avm_debug")]
     pub debug_output: bool,
+
+    pub optimizer_enabled: bool,
 }
 
 impl<'gc> Avm2<'gc> {
     /// Construct a new AVM interpreter.
-    pub fn new(context: &mut GcContext<'_, 'gc>, player_version: u8) -> Self {
+    pub fn new(
+        context: &mut GcContext<'_, 'gc>,
+        player_version: u8,
+        player_runtime: PlayerRuntime,
+    ) -> Self {
         let playerglobals_domain = Domain::uninitialized_domain(context.gc_context, None);
         let stage_domain =
             Domain::uninitialized_domain(context.gc_context, Some(playerglobals_domain));
@@ -191,6 +209,7 @@ impl<'gc> Avm2<'gc> {
 
         Self {
             player_version,
+            player_runtime,
             stack: Vec::new(),
             scope_stack: Vec::new(),
             call_stack: GcCell::new(context.gc_context, CallStack::new()),
@@ -235,11 +254,13 @@ impl<'gc> Avm2<'gc> {
 
             orphan_objects: Default::default(),
 
-            // Set the lowest version for now - this be overriden when we set our movie
+            // Set the lowest version for now - this will be overridden when we set our movie
             root_api_version: ApiVersion::AllVersions,
 
             #[cfg(feature = "avm_debug")]
             debug_output: false,
+
+            optimizer_enabled: true,
         }
     }
 
@@ -247,6 +268,10 @@ impl<'gc> Avm2<'gc> {
         let globals = context.avm2.playerglobals_domain;
         let mut activation = Activation::from_domain(context.reborrow(), globals);
         globals::load_player_globals(&mut activation, globals)
+    }
+
+    pub fn playerglobals_domain(&self) -> Domain<'gc> {
+        self.playerglobals_domain
     }
 
     /// Return the current set of system classes.
@@ -270,12 +295,19 @@ impl<'gc> Avm2<'gc> {
         let (method, scope, _domain) = script.init();
         match method {
             Method::Native(method) => {
-                //This exists purely to check if the builtin is OK with being called with
-                //no parameters.
+                if method.resolved_signature.read().is_none() {
+                    method.resolve_signature(&mut init_activation)?;
+                }
+
+                let resolved_signature = method.resolved_signature.read();
+                let resolved_signature = resolved_signature.as_ref().unwrap();
+
+                // This exists purely to check if the builtin is OK with being called with
+                // no parameters.
                 init_activation.resolve_parameters(
                     Method::Native(method),
                     &[],
-                    &method.signature,
+                    resolved_signature,
                     None,
                 )?;
                 init_activation
@@ -312,7 +344,7 @@ impl<'gc> Avm2<'gc> {
 
     /// Adds a `MovieClip` to the orphan list. In AVM2, movies advance their
     /// frames even when they are not on a display list. Unfortunately,
-    /// mutliple SWFS rely on this behavior, so we need to match Flash's
+    /// multiple SWFS rely on this behavior, so we need to match Flash's
     /// behavior. This should not be called manually - `movie_clip` will
     /// call it when necessary.
     pub fn add_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
@@ -533,24 +565,27 @@ impl<'gc> Avm2<'gc> {
             Ok(abc) => abc,
             Err(_) => {
                 let mut activation = Activation::from_nothing(context.reborrow());
-                return Err(Error::AvmError(crate::avm2::error::verify_error(
-                    &mut activation,
-                    "Error #1107: The ABC data is corrupt, attempt to read out of bounds.",
-                    1107,
-                )?));
+                return Err(make_error_1107(&mut activation));
             }
         };
 
+        let mut activation = Activation::from_domain(context.reborrow(), domain);
+        // Make sure we have the correct domain for code that tries to access it
+        // using `activation.domain()`
+        activation.set_outer(ScopeChain::new(domain));
+
         let num_scripts = abc.scripts.len();
-        let tunit = TranslationUnit::from_abc(abc, domain, name, movie, context.gc_context);
+        let tunit =
+            TranslationUnit::from_abc(abc, domain, name, movie, activation.context.gc_context);
+        tunit.load_classes(&mut activation)?;
         for i in 0..num_scripts {
-            tunit.load_script(i as u32, context)?;
+            tunit.load_script(i as u32, &mut activation)?;
         }
 
         if !flags.contains(DoAbc2Flag::LAZY_INITIALIZE) {
             for i in 0..num_scripts {
-                if let Some(mut script) = tunit.get_script(i) {
-                    script.globals(context)?;
+                if let Some(script) = tunit.get_script(i) {
+                    script.globals(&mut activation.context)?;
                 }
             }
         }
@@ -562,8 +597,13 @@ impl<'gc> Avm2<'gc> {
     }
 
     /// Pushes an executable on the call stack
-    pub fn push_call(&self, mc: &Mutation<'gc>, calling: &Executable<'gc>) {
-        self.call_stack.write(mc).push(calling)
+    pub fn push_call(
+        &self,
+        mc: &Mutation<'gc>,
+        method: Method<'gc>,
+        superclass: Option<ClassObject<'gc>>,
+    ) {
+        self.call_stack.write(mc).push(method, superclass)
     }
 
     /// Pushes script initializer (global init) on the call stack
@@ -580,10 +620,16 @@ impl<'gc> Avm2<'gc> {
         self.call_stack
     }
 
+    #[cold]
+    fn stack_overflow(&self) {
+        tracing::warn!("Avm2::push: Stack overflow");
+    }
+
     /// Push a value onto the operand stack.
+    #[inline(always)]
     fn push(&mut self, value: impl Into<Value<'gc>>, depth: usize, max: usize) {
         if self.stack.len() - depth > max {
-            tracing::warn!("Avm2::push: Stack overflow");
+            self.stack_overflow();
             return;
         }
         let mut value = value.into();
@@ -600,11 +646,27 @@ impl<'gc> Avm2<'gc> {
         self.stack.push(value);
     }
 
+    /// Push a value onto the operand stack.
+    /// This is like `push`, but does not handle `PrimitiveObject`
+    /// and does not check for stack overflows.
+    #[inline(always)]
+    fn push_raw(&mut self, value: impl Into<Value<'gc>>) {
+        let value = value.into();
+        avm_debug!(self, "Stack push {}: {value:?}", self.stack.len());
+        self.stack.push(value);
+    }
+
     /// Retrieve the top-most value on the operand stack.
     #[allow(clippy::let_and_return)]
+    #[inline(always)]
     fn pop(&mut self, depth: usize) -> Value<'gc> {
-        let value = if self.stack.len() <= depth {
+        #[cold]
+        fn stack_underflow() {
             tracing::warn!("Avm2::pop: Stack underflow");
+        }
+
+        let value = if self.stack.len() <= depth {
+            stack_underflow();
             Value::Undefined
         } else {
             self.stack.pop().unwrap_or(Value::Undefined)
@@ -617,13 +679,19 @@ impl<'gc> Avm2<'gc> {
 
     /// Peek the n-th value from the end of the operand stack.
     #[allow(clippy::let_and_return)]
+    #[inline(always)]
     fn peek(&mut self, index: usize) -> Value<'gc> {
+        #[cold]
+        fn stack_underflow() {
+            tracing::warn!("Avm2::peek: Stack underflow");
+        }
+
         let value = self
             .stack
             .get(self.stack.len() - index - 1)
             .copied()
             .unwrap_or_else(|| {
-                tracing::warn!("Avm2::peek: Stack underflow");
+                stack_underflow();
                 Value::Undefined
             });
 
@@ -642,20 +710,20 @@ impl<'gc> Avm2<'gc> {
 
     fn push_scope(&mut self, scope: Scope<'gc>, depth: usize, max: usize) {
         if self.scope_stack.len() - depth > max {
-            tracing::warn!("Avm2::push_scope: Scope Stack overflow");
+            tracing::warn!("Avm2::push_scope: Scope stack overflow");
             return;
         }
 
         self.scope_stack.push(scope);
     }
 
-    fn pop_scope(&mut self, depth: usize) -> Option<Scope<'gc>> {
+    fn pop_scope(&mut self, depth: usize) {
         if self.scope_stack.len() <= depth {
-            tracing::warn!("Avm2::pop_scope: Scope Stack underflow");
-            None
-        } else {
-            self.scope_stack.pop()
+            tracing::warn!("Avm2::pop_scope: Scope stack underflow");
+            return;
         }
+
+        self.scope_stack.pop();
     }
 
     #[cfg(feature = "avm_debug")]
@@ -682,6 +750,14 @@ impl<'gc> Avm2<'gc> {
     /// https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/AvmCore.cpp#L5809C25-L5809C25
     pub fn find_public_namespace(&self) -> Namespace<'gc> {
         self.public_namespaces[self.root_api_version as usize]
+    }
+
+    pub fn optimizer_enabled(&self) -> bool {
+        self.optimizer_enabled
+    }
+
+    pub fn set_optimizer_enabled(&mut self, value: bool) {
+        self.optimizer_enabled = value;
     }
 }
 

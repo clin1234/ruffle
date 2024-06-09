@@ -2,7 +2,7 @@ use crate::avm2::{
     Activation as Avm2Activation, Object as Avm2Object, StageObject as Avm2StageObject,
 };
 use crate::context::{RenderContext, UpdateContext};
-use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
+use crate::display_object::{DisplayObjectBase, DisplayObjectPtr};
 use crate::font::TextRenderSettings;
 use crate::prelude::*;
 use crate::tag_utils::SwfMovie;
@@ -243,7 +243,7 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
         _instantiated_by: Instantiator,
         _run_frame: bool,
     ) {
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             let domain = context
                 .library
                 .library_for_movie(self.movie())

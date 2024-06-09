@@ -99,11 +99,11 @@ impl<'a> Reader<'a> {
         Ok(self.read_encoded_u32()? as i32)
     }
 
-    fn read_string(&mut self) -> Result<String> {
+    fn read_string(&mut self) -> Result<Vec<u8>> {
         let len = self.read_u30()?;
         // TODO: Avoid allocating a String.
-        let mut s = String::with_capacity(len as usize);
-        self.read_slice(len as usize)?.read_to_string(&mut s)?;
+        let mut s = Vec::with_capacity(len as usize);
+        self.read_slice(len as usize)?.read_to_end(&mut s)?;
         Ok(s)
     }
 
@@ -544,7 +544,7 @@ impl<'a> Reader<'a> {
                 num_args: self.read_u30()?,
             },
             OpCode::CallMethod => Op::CallMethod {
-                index: self.read_index()?,
+                index: self.read_u30()?,
                 num_args: self.read_u30()?,
             },
             OpCode::CallProperty => Op::CallProperty {
@@ -754,7 +754,7 @@ impl<'a> Reader<'a> {
             OpCode::Li16 => Op::Li16,
             OpCode::Li32 => Op::Li32,
             OpCode::Li8 => Op::Li8,
-            OpCode::LookupSwitch => Op::LookupSwitch {
+            OpCode::LookupSwitch => Op::LookupSwitch(Box::new(LookupSwitch {
                 default_offset: self.read_i24()?,
                 case_offsets: {
                     let num_cases = self.read_u30()? + 1;
@@ -764,7 +764,7 @@ impl<'a> Reader<'a> {
                     }
                     case_offsets.into()
                 },
-            },
+            })),
             OpCode::LShift => Op::LShift,
             OpCode::Modulo => Op::Modulo,
             OpCode::Multiply => Op::Multiply,
@@ -795,9 +795,6 @@ impl<'a> Reader<'a> {
             OpCode::PopScope => Op::PopScope,
             OpCode::PushByte => Op::PushByte {
                 value: self.read_u8()?,
-            },
-            OpCode::PushConstant => Op::PushConstant {
-                value: self.read_u30()?,
             },
             OpCode::PushDouble => Op::PushDouble {
                 value: self.read_index()?,

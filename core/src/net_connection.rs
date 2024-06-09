@@ -1,8 +1,10 @@
+use crate::avm1::globals::netconnection::NetConnection as Avm1NetConnectionObject;
+use crate::avm1::Object as Avm1Object;
 use crate::avm2::object::{
     NetConnectionObject as Avm2NetConnectionObject, ResponderObject as Avm2ResponderObject,
 };
 use crate::avm2::{Activation as Avm2Activation, Avm2, EventObject as Avm2EventObject};
-use crate::backend::navigator::{NavigatorBackend, OwnedFuture, Request};
+use crate::backend::navigator::{ErrorResponse, NavigatorBackend, OwnedFuture, Request};
 use crate::context::UpdateContext;
 use crate::loader::Error;
 use crate::string::AvmString;
@@ -10,12 +12,14 @@ use crate::Player;
 use flash_lso::packet::{Header, Message, Packet};
 use flash_lso::types::{AMFVersion, Value as AmfValue};
 use gc_arena::{Collect, DynamicRoot, Rootable};
-use generational_arena::{Arena, Index};
+use slotmap::{new_key_type, SlotMap};
 use std::fmt::{Debug, Formatter};
 use std::rc::Rc;
 use std::sync::{Mutex, Weak};
 
-pub type NetConnectionHandle = Index;
+new_key_type! {
+    pub struct NetConnectionHandle;
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum ResponderCallback {
@@ -26,12 +30,14 @@ pub enum ResponderCallback {
 #[derive(Clone)]
 pub enum ResponderHandle {
     Avm2(DynamicRoot<Rootable![Avm2ResponderObject<'_>]>),
+    Avm1(DynamicRoot<Rootable![Avm1Object<'_>]>),
 }
 
 impl Debug for ResponderHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ResponderHandle::Avm2(_) => write!(f, "ResponderHandle::Avm2"),
+            ResponderHandle::Avm1(_) => write!(f, "ResponderHandle::Avm1"),
         }
     }
 }
@@ -50,6 +56,14 @@ impl ResponderHandle {
                     tracing::error!("Unhandled error sending {callback:?} callback: {e}");
                 }
             }
+            ResponderHandle::Avm1(handle) => {
+                let object = context.dynamic_root.fetch(handle);
+                if let Err(e) =
+                    Avm1NetConnectionObject::send_callback(context, *object, callback, &message)
+                {
+                    tracing::error!("Unhandled error sending {callback:?} callback: {e}");
+                }
+            }
         }
     }
 }
@@ -58,12 +72,20 @@ impl ResponderHandle {
 #[collect(no_drop)]
 pub enum NetConnectionObject<'gc> {
     Avm2(Avm2NetConnectionObject<'gc>),
+    Avm1(Avm1Object<'gc>),
 }
 
 impl<'gc> NetConnectionObject<'gc> {
     pub fn set_handle(&self, handle: Option<NetConnectionHandle>) -> Option<NetConnectionHandle> {
         match self {
             NetConnectionObject::Avm2(object) => object.set_handle(handle),
+            NetConnectionObject::Avm1(object) => {
+                if let Some(net_connection) = Avm1NetConnectionObject::cast((*object).into()) {
+                    net_connection.set_handle(handle)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -74,9 +96,15 @@ impl<'gc> From<Avm2NetConnectionObject<'gc>> for NetConnectionObject<'gc> {
     }
 }
 
+impl<'gc> From<Avm1Object<'gc>> for NetConnectionObject<'gc> {
+    fn from(value: Avm1Object<'gc>) -> Self {
+        NetConnectionObject::Avm1(value)
+    }
+}
+
 /// Manages the collection of NetConnections.
 pub struct NetConnections<'gc> {
-    connections: Arena<NetConnection<'gc>>,
+    connections: SlotMap<NetConnectionHandle, NetConnection<'gc>>,
 }
 
 unsafe impl<'gc> Collect for NetConnections<'gc> {
@@ -90,7 +118,7 @@ unsafe impl<'gc> Collect for NetConnections<'gc> {
 impl<'gc> Default for NetConnections<'gc> {
     fn default() -> Self {
         Self {
-            connections: Arena::new(),
+            connections: SlotMap::with_key(),
         }
     }
 }
@@ -123,6 +151,15 @@ impl<'gc> NetConnections<'gc> {
                     ],
                 );
                 Avm2::dispatch_event(&mut activation.context, event, object.into());
+            }
+            NetConnectionObject::Avm1(object) => {
+                if let Err(e) = Avm1NetConnectionObject::on_status_event(
+                    context,
+                    object,
+                    "NetConnection.Connect.Success",
+                ) {
+                    tracing::error!("Unhandled error sending connection callback: {e}");
+                }
             }
         }
     }
@@ -189,6 +226,23 @@ impl<'gc> NetConnections<'gc> {
                     Avm2::dispatch_event(&mut activation.context, event, object.into());
                 }
             }
+            NetConnectionObject::Avm1(object) => {
+                if let Err(e) = Avm1NetConnectionObject::on_status_event(
+                    context,
+                    object,
+                    "NetConnection.Connect.Closed",
+                ) {
+                    tracing::error!("Unhandled error sending connection callback: {e}");
+                }
+                if is_explicit
+                    && matches!(connection.protocol, NetConnectionProtocol::FlashRemoting(_))
+                {
+                    if let Err(e) = Avm1NetConnectionObject::on_empty_status_event(context, object)
+                    {
+                        tracing::error!("Unhandled error sending connection callback: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -219,6 +273,20 @@ impl<'gc> NetConnections<'gc> {
         if let Some(connection) = context.net_connections.connections.get_mut(handle) {
             let responder_handle =
                 ResponderHandle::Avm2(context.dynamic_root.stash(context.gc_context, responder));
+            connection.send(command, Some(responder_handle), message);
+        }
+    }
+
+    pub fn send_avm1(
+        context: &mut UpdateContext<'_, 'gc>,
+        handle: NetConnectionHandle,
+        command: String,
+        message: AmfValue,
+        responder: Avm1Object<'gc>,
+    ) {
+        if let Some(connection) = context.net_connections.connections.get_mut(handle) {
+            let responder_handle =
+                ResponderHandle::Avm1(context.dynamic_root.stash(context.gc_context, responder));
             connection.send(command, Some(responder_handle), message);
         }
     }
@@ -455,7 +523,18 @@ impl FlashRemoting {
                 .expect("Must be able to serialize a packet");
             let request = Request::post(url, Some((bytes, "application/x-amf".to_string())));
             let fetch = player.lock().unwrap().navigator().fetch(request);
-            let response = match fetch.await {
+            let response: Result<_, ErrorResponse> = async {
+                let response = fetch.await?;
+                let url = response.url().to_string();
+                let body = response
+                    .body()
+                    .await
+                    .map_err(|error| ErrorResponse { url, error })?;
+
+                Ok(body)
+            }
+            .await;
+            let response = match response {
                 Ok(response) => response,
                 Err(response) => {
                     player.lock().unwrap().update(|uc| {
@@ -489,6 +568,15 @@ impl FlashRemoting {
                                         object.into(),
                                     );
                                 }
+                                NetConnectionObject::Avm1(object) => {
+                                    if let Err(e) =
+                                        Avm1NetConnectionObject::on_empty_status_event(uc, object)
+                                    {
+                                        tracing::error!(
+                                            "Unhandled error sending connection callback: {e}"
+                                        );
+                                    }
+                                }
                             }
                         }
                     });
@@ -497,7 +585,7 @@ impl FlashRemoting {
             };
 
             // Flash completely ignores invalid responses, it seems
-            if let Ok(response_packet) = flash_lso::packet::read::parse(&response.body) {
+            if let Ok(response_packet) = flash_lso::packet::read::parse(&response) {
                 player.lock().unwrap().update(|uc| {
                     for message in response_packet.messages {
                         if let Some(target_uri) = message.target_uri.strip_prefix('/') {

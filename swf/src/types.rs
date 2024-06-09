@@ -7,6 +7,7 @@
 use crate::string::SwfStr;
 use bitflags::bitflags;
 use enum_map::Enum;
+use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU8;
 use std::str::FromStr;
@@ -87,7 +88,7 @@ impl Header {
 
 /// The extended metadata of an SWF file.
 ///
-/// This includes the SWF header data as well as metdata from the FileAttributes and
+/// This includes the SWF header data as well as metadata from the FileAttributes and
 /// SetBackgroundColor tags.
 ///
 /// This metadata may not reflect the actual data inside a malformed SWF; for example,
@@ -163,7 +164,7 @@ impl HeaderExt {
 
     /// Whether this SWF contains XMP metadata in a Metadata tag.
     #[inline]
-    pub fn has_metdata(&self) -> bool {
+    pub fn has_metadata(&self) -> bool {
         self.file_attributes.contains(FileAttributes::HAS_METADATA)
     }
 
@@ -762,7 +763,7 @@ pub enum FillStyle {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Gradient {
     pub matrix: Matrix,
     pub spread: GradientSpread,
@@ -770,7 +771,7 @@ pub struct Gradient {
     pub records: Vec<GradientRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq, Enum)]
+#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq, Enum, Hash)]
 pub enum GradientSpread {
     Pad = 0,
     Reflect = 1,
@@ -788,7 +789,7 @@ impl GradientSpread {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, FromPrimitive, PartialEq, Hash)]
 pub enum GradientInterpolation {
     Rgb = 0,
     LinearRgb = 1,
@@ -805,7 +806,7 @@ impl GradientInterpolation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct GradientRecord {
     pub ratio: u8,
     pub color: Color,
@@ -1696,7 +1697,7 @@ pub struct DefineBitsLossless<'a> {
     pub format: BitmapFormat,
     pub width: u16,
     pub height: u16,
-    pub data: &'a [u8],
+    pub data: Cow<'a, [u8]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1741,6 +1742,7 @@ pub enum VideoCodec {
     Vp6 = 4,
     Vp6WithAlpha = 5,
     ScreenVideoV2 = 6,
+    H264 = 7,
 }
 
 impl VideoCodec {

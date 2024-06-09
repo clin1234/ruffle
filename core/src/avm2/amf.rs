@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use crate::avm2::api_version::ApiVersion;
 use crate::avm2::bytearray::ByteArrayStorage;
 use crate::avm2::object::{ByteArrayObject, TObject, VectorObject};
 use crate::avm2::vector::VectorStorage;
@@ -15,7 +14,7 @@ use flash_lso::types::{Attribute, ClassDefinition, Value as AmfValue};
 use fnv::FnvHashMap;
 
 use super::property::Property;
-use super::{ClassObject, Namespace, QName};
+use super::{ClassObject, QName};
 
 pub type ObjectTable<'gc> = FnvHashMap<Object<'gc>, Rc<AmfValue>>;
 
@@ -70,12 +69,8 @@ pub fn serialize_value<'gc>(
                     }
                 }
 
-                if sparse.is_empty() {
-                    Some(AmfValue::StrictArray(dense))
-                } else {
-                    let len = sparse.len() as u32;
-                    Some(AmfValue::ECMAArray(dense, sparse, len))
-                }
+                let len = o.as_array_storage().unwrap().length() as u32;
+                Some(AmfValue::ECMAArray(dense, sparse, len))
             } else if let Some(vec) = o.as_vector_storage() {
                 let val_type = vec.value_type();
                 if val_type == Some(activation.avm2().classes().int) {
@@ -135,7 +130,7 @@ pub fn serialize_value<'gc>(
                 let name = class_to_alias(activation, class);
 
                 let mut attributes = EnumSet::empty();
-                if !class.inner_class_definition().read().is_sealed() {
+                if !class.inner_class_definition().is_sealed() {
                     attributes.insert(Attribute::Dynamic);
                 }
 
@@ -173,15 +168,12 @@ fn alias_to_class<'gc>(
     alias: AvmString<'gc>,
 ) -> Result<ClassObject<'gc>, Error<'gc>> {
     let mut target_class = activation.avm2().classes().object;
-    let ns = Namespace::package(
-        "flash.net",
-        ApiVersion::AllVersions,
-        &mut activation.context.borrow_gc(),
-    );
+
+    let qname = QName::new(activation.avm2().flash_net_internal, "_getClassByAlias");
     let method = activation
         .avm2()
         .playerglobals_domain
-        .get_defined_value(activation, QName::new(ns, "getClassByAlias"))?;
+        .get_defined_value(activation, qname)?;
 
     let class = method
         .as_object()
@@ -438,8 +430,36 @@ pub fn deserialize_value<'gc>(
             );
             VectorObject::from_vector(storage, activation)?.into()
         }
-        AmfValue::Dictionary(..) | AmfValue::Custom(..) | AmfValue::Reference(_) => {
-            tracing::error!("Deserialization not yet implemented: {:?}", val);
+        AmfValue::Dictionary(values, has_weak_keys) => {
+            let obj = activation
+                .avm2()
+                .classes()
+                .dictionary
+                .construct(activation, &[(*has_weak_keys).into()])?;
+            let dict_obj = obj.as_dictionary_object().unwrap();
+
+            for (key, value) in values {
+                let key = deserialize_value(activation, key)?;
+                let value = deserialize_value(activation, value)?;
+
+                if let Value::Object(key) = key {
+                    dict_obj.set_property_by_object(key, value, activation.context.gc_context);
+                } else {
+                    let key_string = key.coerce_to_string(activation)?;
+                    dict_obj.set_public_property(key_string, value, activation)?;
+                }
+            }
+            dict_obj.into()
+        }
+        AmfValue::Custom(..) => {
+            tracing::error!("Deserialization not yet implemented for Custom: {:?}", val);
+            Value::Undefined
+        }
+        AmfValue::Reference(_) => {
+            tracing::error!(
+                "Deserialization not yet implemented for Reference: {:?}",
+                val
+            );
             Value::Undefined
         }
         AmfValue::AMF3(val) => deserialize_value(activation, val)?,

@@ -15,6 +15,15 @@ pub static US_ENGLISH: LanguageIdentifier = langid!("en-US");
 pub enum FontDefinition<'a> {
     /// A singular DefineFont tag extracted from a swf.
     SwfTag(swf::Font<'a>, &'static swf::Encoding),
+
+    /// A font contained in an external file, such as a ttf.
+    FontFile {
+        name: String,
+        is_bold: bool,
+        is_italic: bool,
+        data: Vec<u8>,
+        index: u32,
+    },
 }
 
 /// A filter specifying a category that can be selected from a file chooser dialog
@@ -39,15 +48,14 @@ pub trait FileDialogResult: Downcast {
     fn file_name(&self) -> Option<String>;
     fn size(&self) -> Option<u64>;
     fn file_type(&self) -> Option<String>;
-    fn creator(&self) -> Option<String>;
+    fn creator(&self) -> Option<String> {
+        None
+    }
     fn contents(&self) -> &[u8];
-    /// Write the given data to the chosen file
-    /// This will not necessarily by reflected in future calls to other functions (such as [FileDialogResult::size]),
-    /// until [FileDialogResult::refresh] is called
-    fn write(&self, data: &[u8]);
-    /// Refresh any internal metadata, any future calls to other functions (such as [FileDialogResult::size]) will reflect
+    /// Write the given data to the chosen file and refresh any internal metadata.
+    /// Any future calls to other functions (such as [FileDialogResult::size]) will reflect
     /// the state at the time of the last refresh
-    fn refresh(&mut self);
+    fn write_and_refresh(&mut self, data: &[u8]);
 }
 impl_downcast!(FileDialogResult);
 
@@ -73,7 +81,7 @@ pub trait UiBackend: Downcast {
     /// Displays a message about an error during root movie download.
     /// In particular, on web this can be a CORS error, which we can sidestep
     /// by providing a direct .swf link instead.
-    fn display_root_movie_download_failed_message(&self);
+    fn display_root_movie_download_failed_message(&self, _invalid_swf: bool);
 
     // Unused, but kept in case we need it later.
     fn message(&self, message: &str);
@@ -81,7 +89,7 @@ pub trait UiBackend: Downcast {
     // Only used on web.
     fn open_virtual_keyboard(&self);
 
-    fn language(&self) -> &LanguageIdentifier;
+    fn language(&self) -> LanguageIdentifier;
 
     fn display_unsupported_video(&self, url: Url);
 
@@ -96,7 +104,7 @@ pub trait UiBackend: Downcast {
         name: &str,
         is_bold: bool,
         is_italic: bool,
-        register: &dyn FnMut(FontDefinition),
+        register: &mut dyn FnMut(FontDefinition),
     );
 
     /// Displays a file selection dialog, returning None if the dialog cannot be displayed
@@ -267,7 +275,7 @@ impl UiBackend for NullUiBackend {
         Ok(())
     }
 
-    fn display_root_movie_download_failed_message(&self) {}
+    fn display_root_movie_download_failed_message(&self, _invalid_swf: bool) {}
 
     fn message(&self, _message: &str) {}
 
@@ -278,14 +286,14 @@ impl UiBackend for NullUiBackend {
         _name: &str,
         _is_bold: bool,
         _is_italic: bool,
-        _register: &dyn FnMut(FontDefinition),
+        _register: &mut dyn FnMut(FontDefinition),
     ) {
     }
 
     fn open_virtual_keyboard(&self) {}
 
-    fn language(&self) -> &LanguageIdentifier {
-        &US_ENGLISH
+    fn language(&self) -> LanguageIdentifier {
+        US_ENGLISH.clone()
     }
 
     fn display_file_open_dialog(
@@ -350,14 +358,9 @@ impl FileDialogResult for NullFileDialogResult {
     fn file_type(&self) -> Option<String> {
         None
     }
-    fn creator(&self) -> Option<String> {
-        None
-    }
-
     fn contents(&self) -> &[u8] {
         &[]
     }
 
-    fn write(&self, _data: &[u8]) {}
-    fn refresh(&mut self) {}
+    fn write_and_refresh(&mut self, _data: &[u8]) {}
 }

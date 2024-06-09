@@ -9,9 +9,6 @@ package flash.display {
     import flash.display.Stage;
     import flash.geom.Point;
     import flash.events.EventDispatcher;
-    
-    import __ruffle__.stub_getter;
-    import __ruffle__.stub_setter;
 
     [Ruffle(InstanceAllocator)]
     [Ruffle(NativeInstanceInit)]
@@ -87,6 +84,9 @@ package flash.display {
 
         public native function get visible():Boolean;
         public native function set visible(value:Boolean):void;
+
+        public native function get metaData():Object;
+        public native function set metaData(value:Object):void;
 
         public native function get mouseX():Number;
 

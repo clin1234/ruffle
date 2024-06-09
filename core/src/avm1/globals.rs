@@ -42,6 +42,7 @@ mod matrix;
 pub(crate) mod mouse;
 pub(crate) mod movie_clip;
 mod movie_clip_loader;
+pub(crate) mod netconnection;
 pub(crate) mod netstream;
 pub(crate) mod number;
 mod object;
@@ -52,6 +53,7 @@ pub(crate) mod shared_object;
 pub(crate) mod sound;
 mod stage;
 pub(crate) mod string;
+pub(crate) mod style_sheet;
 pub(crate) mod system;
 pub(crate) mod system_capabilities;
 pub(crate) mod system_ime;
@@ -535,6 +537,7 @@ pub fn create_globals<'gc>(
 
     let sound_proto = sound::create_proto(context, object_proto, function_proto);
 
+    let style_sheet_proto = style_sheet::create_proto(context, object_proto, function_proto);
     let text_field_proto = text_field::create_proto(context, object_proto, function_proto);
     let text_format_proto = text_format::create_proto(context, object_proto, function_proto);
 
@@ -581,6 +584,7 @@ pub fn create_globals<'gc>(
 
     let video_proto = video::create_proto(context, object_proto, function_proto);
     let netstream_proto = netstream::create_proto(context, object_proto, function_proto);
+    let netconnection_proto = netconnection::create_proto(context, object_proto, function_proto);
     let xml_socket_proto = xml_socket::create_proto(context, object_proto, function_proto);
 
     //TODO: These need to be constructors and should also set `.prototype` on each one
@@ -647,6 +651,13 @@ pub fn create_globals<'gc>(
         function_proto,
         sound_proto,
     );
+    let style_sheet = FunctionObject::constructor(
+        gc_context,
+        Executable::Native(style_sheet::constructor),
+        constructor_to_fn!(style_sheet::constructor),
+        function_proto,
+        style_sheet_proto,
+    );
     let text_field = FunctionObject::constructor(
         gc_context,
         Executable::Native(text_field::constructor),
@@ -675,6 +686,7 @@ pub fn create_globals<'gc>(
     let boolean = boolean::create_boolean_object(context, boolean_proto, function_proto);
     let date = date::create_constructor(context, object_proto, function_proto);
     let netstream = netstream::create_class(context, netstream_proto, function_proto);
+    let netconnection = netconnection::create_class(context, netconnection_proto, function_proto);
     let xml_socket = xml_socket::create_class(context, xml_socket_proto, function_proto);
 
     let flash = ScriptObject::new(gc_context, Some(object_proto));
@@ -935,6 +947,12 @@ pub fn create_globals<'gc>(
         text_field.into(),
         Attribute::DONT_ENUM,
     );
+    text_field.define_value(
+        gc_context,
+        "StyleSheet",
+        style_sheet.into(),
+        Attribute::DONT_ENUM | Attribute::VERSION_7,
+    );
     globals.define_value(
         gc_context,
         "TextFormat",
@@ -1074,6 +1092,12 @@ pub fn create_globals<'gc>(
         gc_context,
         "NetStream",
         netstream.into(),
+        Attribute::DONT_ENUM,
+    );
+    globals.define_value(
+        gc_context,
+        "NetConnection",
+        netconnection.into(),
         Attribute::DONT_ENUM,
     );
     globals.define_value(

@@ -16,7 +16,7 @@ use crate::backend::audio::{
 use crate::backend::navigator::Request;
 use crate::buffer::{Buffer, Slice, Substream, SubstreamError};
 use crate::context::UpdateContext;
-use crate::display_object::MovieClip;
+use crate::display_object::{MovieClip, TDisplayObject};
 use crate::loader::Error;
 use crate::string::AvmString;
 use crate::vminterface::AvmObject;
@@ -164,6 +164,7 @@ impl<'gc> Eq for NetStream<'gc> {}
 pub enum NetStreamType {
     /// The stream is an FLV.
     Flv {
+        #[allow(dead_code)] // set but never read
         header: FlvHeader,
 
         /// The currently playing video track's stream instance.
@@ -186,6 +187,12 @@ pub struct NetStreamData<'gc> {
 
     /// The buffer position that we are currently seeking to.
     offset: usize,
+
+    /// The expected length of the buffer once downloading is complete.
+    ///
+    /// `None` indicates that downloading is already complete and that the
+    /// length of the associated `Buffer` is the final length.
+    expected_length: Option<usize>,
 
     /// The buffer position for processing incoming data.
     ///
@@ -210,6 +217,10 @@ pub struct NetStreamData<'gc> {
     ///
     /// Seeks are only executed on the next stream tick.
     queued_seek_time: Option<f64>,
+
+    /// The number of seconds of video data that should be buffered. This is
+    /// currently unsupported and changing it has no effect.
+    buffer_time: f64,
 
     /// The last decoded bitmap.
     ///
@@ -256,6 +267,7 @@ impl<'gc> NetStream<'gc> {
                 stream_type: None,
                 stream_time: 0.0,
                 queued_seek_time: None,
+                buffer_time: 0.1,
                 last_decoded_bitmap: None,
                 avm_object,
                 avm2_client: None,
@@ -264,6 +276,7 @@ impl<'gc> NetStream<'gc> {
                 sound_instance: None,
                 attached_to: None,
                 playing: false,
+                expected_length: Some(0),
             },
         ))
     }
@@ -308,6 +321,20 @@ impl<'gc> NetStream<'gc> {
         write.queued_seek_time = None;
         write.audio_stream = None;
         write.sound_instance = None;
+        write.expected_length = Some(0);
+    }
+
+    /// Set the total number of bytes expected to be downloaded.
+    pub fn set_expected_length(self, context: &mut UpdateContext<'_, 'gc>, expected: usize) {
+        let mut write = self.0.write(context.gc_context);
+        let len = write.buffer.len();
+
+        // The subtract is to avoid reserving space for already-downloaded data.
+        if expected > len {
+            write.buffer.reserve(expected - len);
+        }
+
+        write.expected_length = Some(expected);
     }
 
     /// Append data to the `NetStream`'s current internal buffer.
@@ -322,6 +349,8 @@ impl<'gc> NetStream<'gc> {
     pub fn load_buffer(self, context: &mut UpdateContext<'_, 'gc>, data: &mut Vec<u8>) {
         self.0.write(context.gc_context).buffer.append(data);
 
+        StreamManager::activate(context, self);
+
         // NOTE: The onMetaData event triggers before this event in Flash due to its streaming behavior.
         self.trigger_status_event(
             context,
@@ -329,8 +358,14 @@ impl<'gc> NetStream<'gc> {
         );
     }
 
+    /// Indicate that the buffer has finished loading and that no further data
+    /// is expected to be downloaded to it.
+    pub fn finish_buffer(self, context: &mut UpdateContext<'_, 'gc>) {
+        self.0.write(context.gc_context).expected_length = None;
+    }
+
     pub fn report_error(self, _error: Error) {
-        //TODO: Report an `asyncError` to AVM1 or 2.
+        // TODO: Report an `asyncError` to AVM1 or 2.
     }
 
     pub fn bytes_loaded(self) -> usize {
@@ -338,11 +373,22 @@ impl<'gc> NetStream<'gc> {
     }
 
     pub fn bytes_total(self) -> usize {
-        self.0.read().buffer.len()
+        let read = self.0.read();
+        let buflen = read.buffer.len();
+
+        std::cmp::max(read.expected_length.unwrap_or(buflen), buflen)
     }
 
     pub fn time(self) -> f64 {
         self.0.read().stream_time
+    }
+
+    pub fn buffer_time(self) -> f64 {
+        self.0.read().buffer_time
+    }
+
+    pub fn set_buffer_time(self, mc: &Mutation<'gc>, buffer_time: f64) {
+        self.0.write(mc).buffer_time = buffer_time;
     }
 
     /// Queue a seek to be executed on the next frame tick.
@@ -385,8 +431,6 @@ impl<'gc> NetStream<'gc> {
     /// This function should be run during stream ticks and *not* called by AVM
     /// code to service seek requests.
     pub fn execute_seek(self, context: &mut UpdateContext<'_, 'gc>, offset: f64) {
-        #![allow(clippy::explicit_auto_deref)] //Erroneous lint
-
         self.trigger_status_event(
             context,
             vec![("code", "NetStream.Seek.Notify"), ("level", "status")],
@@ -398,9 +442,13 @@ impl<'gc> NetStream<'gc> {
         }
 
         let mut write = self.0.write(context.gc_context);
+        if write.stream_time == offset {
+            //Don't do anything for no-op seeks.
+            return;
+        }
 
         if let Some(sound) = write.sound_instance {
-            context.stop_sounds_with_handle(sound);
+            context.stop_sound(sound);
             context.audio.stop_sound(sound);
 
             write.sound_instance = None;
@@ -410,7 +458,7 @@ impl<'gc> NetStream<'gc> {
         if matches!(write.stream_type, Some(NetStreamType::Flv { .. })) {
             let slice = write.buffer.to_full_slice();
             let buffer = slice.data();
-            let mut reader = FlvReader::from_parts(&*buffer, write.offset);
+            let mut reader = FlvReader::from_parts(&buffer, write.offset);
             let skipping_back = write.stream_time > offset;
 
             loop {
@@ -463,6 +511,12 @@ impl<'gc> NetStream<'gc> {
                         frame_type: FlvFrameType::Keyframe,
                         ..
                     }) => {
+                        // If we don't backseek when we find the keyframe,
+                        // we will miss the keyframe.
+                        reader
+                            .seek(SeekFrom::Start(old_position))
+                            .expect("valid backseek position");
+
                         break;
                     }
                     _ => continue,
@@ -476,7 +530,7 @@ impl<'gc> NetStream<'gc> {
 
         drop(write);
 
-        if context.is_action_script_3() {
+        if let Some(AvmObject::Avm2(_)) = self.0.read().avm_object {
             self.trigger_status_event(
                 context,
                 vec![
@@ -747,7 +801,6 @@ impl<'gc> NetStream<'gc> {
     /// data is of an unrecognized format. This should be used as a signal to
     /// stop stream processing until new data has been retrieved.
     pub fn sniff_stream_type(self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        #![allow(clippy::explicit_auto_deref)] //Erroneous lint
         let mut write = self.0.write(context.gc_context);
         let slice = write.buffer.to_full_slice();
         let buffer = slice.data();
@@ -761,7 +814,7 @@ impl<'gc> NetStream<'gc> {
 
         match buffer.get(0..3) {
             Some([0x46, 0x4C, 0x56]) => {
-                let mut reader = FlvReader::from_parts(&*buffer, write.offset);
+                let mut reader = FlvReader::from_parts(&buffer, write.offset);
                 match FlvHeader::parse(&mut reader) {
                     Ok(header) => {
                         write.offset = reader.into_parts().1;
@@ -871,7 +924,7 @@ impl<'gc> NetStream<'gc> {
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Got error when registring FLV video stream: {}",
+                                    "Got error when registering FLV video stream: {}",
                                     e
                                 );
                                 return; //TODO: This originally breaks and halts tag processing
@@ -920,6 +973,10 @@ impl<'gc> NetStream<'gc> {
                 ) {
                     Ok(bitmap_info) => {
                         write.last_decoded_bitmap = Some(bitmap_info);
+                        if let Some(mc) = write.attached_to {
+                            mc.invalidate_cached_bitmap(context.gc_context);
+                            *context.needs_render = true;
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Decoding video frame {} failed: {}", frame_id, e);
@@ -929,11 +986,43 @@ impl<'gc> NetStream<'gc> {
             (_, _, FlvVideoPacket::CommandFrame(_command)) => {
                 tracing::warn!("Stub: FLV command frame processing")
             }
-            (_, _, FlvVideoPacket::AvcSequenceHeader(_data)) => {
-                tracing::warn!("Stub: FLV AVC/H.264 Sequence Header processing")
+            (Some(video_handle), _, FlvVideoPacket::AvcSequenceHeader(data)) => {
+                match context
+                    .video
+                    .configure_video_stream_decoder(video_handle, data)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Configuring video decoder {} failed: {}", frame_id, e);
+                    }
+                }
             }
-            (_, _, FlvVideoPacket::AvcNalu { .. }) => {
-                tracing::warn!("Stub: FLV AVC/H.264 NALU processing")
+            (
+                Some(video_handle),
+                Some(codec),
+                FlvVideoPacket::AvcNalu {
+                    composition_time_offset: _,
+                    data,
+                },
+            ) => {
+                let encoded_frame = EncodedFrame {
+                    codec,
+                    data,
+                    frame_id,
+                };
+
+                match context.video.decode_video_stream_frame(
+                    video_handle,
+                    encoded_frame,
+                    context.renderer,
+                ) {
+                    Ok(bitmap_info) => {
+                        write.last_decoded_bitmap = Some(bitmap_info);
+                    }
+                    Err(e) => {
+                        tracing::error!("Decoding video frame {} failed: {}", frame_id, e);
+                    }
+                }
             }
             (_, _, FlvVideoPacket::AvcEndOfSequence) => {
                 tracing::warn!("Stub: FLV AVC/H.264 End of Sequence processing")
@@ -943,6 +1032,9 @@ impl<'gc> NetStream<'gc> {
                     "FLV video tag has invalid codec id {}",
                     video_data.codec_id as u8
                 )
+            }
+            (None, _, _) => {
+                tracing::error!("No video handle")
             }
         }
 
@@ -1032,7 +1124,7 @@ impl<'gc> NetStream<'gc> {
                             _ => unreachable!(),
                         },
                         Err(e) => {
-                            tracing::error!("Got error when registring FLV video stream: {}", e)
+                            tracing::error!("Got error when registering FLV video stream: {}", e)
                         }
                     }
                 } else {
@@ -1046,8 +1138,6 @@ impl<'gc> NetStream<'gc> {
     ///
     /// `dt` is in milliseconds.
     pub fn tick(self, context: &mut UpdateContext<'_, 'gc>, dt: f64) {
-        #![allow(clippy::explicit_auto_deref)] //Erroneous lint
-
         let seek_offset = self.0.write(context.gc_context).queued_seek_time.take();
         if let Some(offset) = seek_offset {
             self.execute_seek(context, offset);
@@ -1070,15 +1160,15 @@ impl<'gc> NetStream<'gc> {
         let slice = write.buffer.to_full_slice();
         let buffer = slice.data();
 
-        let end_time = write.stream_time + dt;
-        let mut end_of_video = false;
+        let max_time = write.stream_time + dt;
+        let mut buffer_underrun = false;
         let mut error = false;
         let mut max_lookahead_audio_tags = 5;
         let mut is_lookahead_tag = false;
 
         //At this point we should know our stream type.
         if matches!(write.stream_type, Some(NetStreamType::Flv { .. })) {
-            let mut reader = FlvReader::from_parts(&*buffer, write.offset);
+            let mut reader = FlvReader::from_parts(&buffer, write.offset);
 
             loop {
                 let tag = FlvTag::parse(&mut reader);
@@ -1088,8 +1178,7 @@ impl<'gc> NetStream<'gc> {
                     // error states or playback ending to trip until we run
                     // those tags "for realsies"
                     if !is_lookahead_tag && matches!(e, FlvError::EndOfData) {
-                        //TODO: Check expected total length for streaming / progressive download
-                        end_of_video = true;
+                        buffer_underrun = true;
                     } else if !is_lookahead_tag {
                         //Corrupt tag or out of data
                         tracing::error!("FLV tag parsing failed: {}", e);
@@ -1100,7 +1189,7 @@ impl<'gc> NetStream<'gc> {
                 }
 
                 let tag = tag.expect("valid tag");
-                is_lookahead_tag = tag.timestamp as f64 >= end_time; //FLV timestamps are also ms
+                is_lookahead_tag = tag.timestamp as f64 >= max_time; //FLV timestamps are also ms
                 if is_lookahead_tag && max_lookahead_audio_tags == 0 {
                     break;
                 }
@@ -1148,27 +1237,36 @@ impl<'gc> NetStream<'gc> {
             }
         }
 
-        write.stream_time = end_time;
+        write.stream_time = max_time;
         if let Err(e) = self.commit_sound_stream(context, &mut write) {
             //TODO: Fire an error event at AS.
             tracing::error!("Error committing sound stream: {}", e);
         }
         drop(write);
 
-        if end_of_video {
+        if buffer_underrun {
+            let is_end_of_video = self.0.read().expected_length.is_none();
+
             self.trigger_status_event(
                 context,
                 vec![("code", "NetStream.Buffer.Flush"), ("level", "status")],
             );
-            self.trigger_status_event(
-                context,
-                vec![("code", "NetStream.Play.Stop"), ("level", "status")],
-            );
+
+            if is_end_of_video {
+                self.trigger_status_event(
+                    context,
+                    vec![("code", "NetStream.Play.Stop"), ("level", "status")],
+                );
+            }
+
             self.trigger_status_event(
                 context,
                 vec![("code", "NetStream.Buffer.Empty"), ("level", "status")],
             );
-            self.pause(context, false);
+
+            if is_end_of_video {
+                self.pause(context, false);
+            }
         }
 
         if error {

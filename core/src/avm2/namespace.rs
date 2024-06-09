@@ -10,7 +10,7 @@ use swf::avm2::types::{Index, Namespace as AbcNamespace};
 
 use super::api_version::ApiVersion;
 
-#[derive(Clone, Copy, Collect, Debug)]
+#[derive(Clone, Copy, Collect, Debug, PartialEq)]
 #[collect(no_drop)]
 pub struct Namespace<'gc>(Gc<'gc, NamespaceData<'gc>>);
 
@@ -32,7 +32,7 @@ enum NamespaceData<'gc> {
     Any,
 }
 
-fn strip_version_mark(url: &WStr) -> Option<(&WStr, ApiVersion)> {
+fn strip_version_mark(url: &WStr, is_playerglobals: bool) -> Option<(&WStr, ApiVersion)> {
     // See https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/AvmCore.h#L485
     const MIN_API_MARK: usize = 0xE000;
     const MAX_API_MARK: usize = 0xF8FF;
@@ -42,6 +42,16 @@ fn strip_version_mark(url: &WStr) -> Option<(&WStr, ApiVersion)> {
     if let Some(Ok(chr)) = url.chars().last() {
         let chr = chr as usize;
         if chr >= MIN_API_MARK && chr <= MAX_API_MARK {
+            if !is_playerglobals {
+                // Always return None for non-playerglobals to fall back to root api version as avmplus does
+                // https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/AbcParser.cpp#L1510
+                // Warn just for non-playerglobals with version marks
+                tracing::warn!(
+                    "Ignoring url {url:?} with version mark in non-playerglobals domain"
+                );
+                return None;
+            }
+
             // Note - sometimes asc.jar emits a version mark of 0xE000.
             // We treat this as `AllVersions`
             let version = if chr >= WEIRD_START_MARK {
@@ -107,9 +117,38 @@ impl<'gc> Namespace<'gc> {
             )));
         }
 
-        // FIXME - what other versioned urls are there?
-        let is_versioned_url = |url: AvmAtom<'gc>| url.as_wstr().is_empty();
-
+        // FIXME - AvmCore gets this from an external source. I'm not exactly sure
+        // what the contents it, but it's probably all 'flash.*', 'air.*', etc. namespaces
+        // This is only ever used when parsing our playerglobals, so we just treat everything
+        // as versioned for now. As a result, any intra-playerglobal *references* that lack
+        // an explicit version marker will be treated as ApiVersion::VM_INTERNAL.
+        // The only exceptions are the 'AS3' ("http://adobe.com/AS3/2006/builtin")
+        // and "flash_proxy" (b"http://www.adobe.com/2006/actionscript/flash/proxy") namespaces.
+        // These are used by user code, and are not given version markers in playerglobals
+        // by the ASC compiler. As a result, we do not treat them as versioned, so that
+        // references from within playerglobals will use ApiVersion::AllVersions;
+        //
+        // For example, consider the AIR-only class `flash.net.DatagramSocket`. The class
+        // definition has version marker corresponding to an AIR-only version - when running
+        // the Flash Player runtime, we will map this to VM_INTERNAL in `ApiVersion::to_valid_playerglobals_version`
+        // (which hides it from user code). However, the playerglobal will still try to initialize this class via:
+        //
+        // ```
+        // initproperty QName(PackageNamespace("flash.net"),"DatagramSocket")
+        // ```
+        //
+        // This is a namespace without a version marker (the compiler only ever generates version
+        // markers in definitions, not references). As a result, we will treat this as a VM_INTERNAL
+        // which will allow `initproperty` to see the `flash.net.DatagramSocket` class definition,
+        // even when running as the FlashPlayer (not AIR) runtime.
+        //
+        // Outside of playerglobals, we'll tag all namespaces with a version based on the SWF version.
+        // This is always less than VM_INTERNAL, so AIR-only classes will be correctly hidden outside
+        // of playerglobals when using the FlashPlayer runtime.
+        let is_versioned_url = |url: AvmAtom<'gc>| {
+            url.as_wstr() != b"http://adobe.com/AS3/2006/builtin"
+                && url.as_wstr() != b"http://www.adobe.com/2006/actionscript/flash/proxy"
+        };
         let is_public = matches!(
             abc_namespace,
             AbcNamespace::Namespace(_) | AbcNamespace::Package(_)
@@ -121,22 +160,36 @@ impl<'gc> Namespace<'gc> {
                 .is_playerglobals_domain(context.avm2);
 
             let mut api_version = ApiVersion::AllVersions;
-            let stripped = strip_version_mark(namespace_name.as_wstr());
+            let stripped = strip_version_mark(namespace_name.as_wstr(), is_playerglobals);
             let has_version_mark = stripped.is_some();
             if let Some((stripped, version)) = stripped {
-                assert!(
-                    is_playerglobals,
-                    "Found versioned url {namespace_name:?} in non-playerglobals domain"
-                );
                 let stripped_string = AvmString::new(context.gc_context, stripped);
                 namespace_name = context.interner.intern(context.gc_context, stripped_string);
                 api_version = version;
             }
 
             if is_playerglobals {
-                if !has_version_mark && is_public && is_versioned_url(namespace_name) {
+                if !has_version_mark
+                // NOTE - we deviate from avmplus by only applying VM_INTERNAL to unmarked playerglobal namespaces
+                // that use 'Package', instead of both 'Namespace' and 'Package'. This is because our version
+                // of asc.jar does *not* apply version markers to method definitions in interfaces (unlike
+                // method definitions in normal classes). Interface method definitions in playerglobals always
+                // seem to be emitted with a 'Namespace' namespace, so we can avoid marking them as 'VM_INTERNAL'
+                // by only applying this check to 'Package' namespaces.
+                // If playerglobals ever ends up with initialization code that uses a 'Namespace' namespace,
+                // (e.g. `initproperty QName(Namespace("flash.net"),"DatagramSocket")`), then this would break.
+                // However, it would do immediately during playerglobals loading, so it would be guaranteed
+                // to be caught by our test suite.
+                    && matches!(abc_namespace, AbcNamespace::Package(_))
+                    && is_versioned_url(namespace_name)
+                {
                     api_version = ApiVersion::VM_INTERNAL;
                 }
+                // In avmplus, this conversion is done later in 'getValidApiVersion'
+                // However, there's no reason to hold on to invalid API versions for the
+                // current active series (player runtime), so let's just do the conversion immediately.
+                api_version =
+                    api_version.to_valid_playerglobals_version(context.avm2.player_runtime);
             } else if is_public {
                 api_version = translation_unit.api_version(context.avm2);
             };
@@ -252,7 +305,7 @@ impl<'gc> Namespace<'gc> {
 
     /// Compares this namespace to another, considering them equal if this namespace's version
     /// is less than or equal to the other (definitions in this namespace version can be
-    /// seen by the other). This is used to implement `ProperyMap`, where we want to
+    /// seen by the other). This is used to implement `PropertyMap`, where we want to
     /// a definition with `ApiVersion::SWF_16` to be visible when queried from
     /// a SWF with `ApiVersion::SWF_16` or any higher version.
     pub fn matches_ns(&self, other: Self) -> bool {
@@ -266,13 +319,7 @@ impl<'gc> Namespace<'gc> {
             ) => {
                 let name_matches = name1 == name2;
                 let version_matches = version1 <= version2;
-                if name_matches && !version_matches {
-                    tracing::info!(
-                        "Rejecting namespace match due to versions: {:?} {:?}",
-                        self.0,
-                        other.0
-                    );
-                }
+
                 name_matches && version_matches
             }
             _ => false,

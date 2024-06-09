@@ -27,8 +27,14 @@ pub fn bitmap_allocator<'gc>(
     while let Some(class) = class_object {
         if class == bitmap_cls {
             let bitmap_data = BitmapDataWrapper::dummy(activation.context.gc_context);
-            let display_object =
-                Bitmap::new_with_bitmap_data(&mut activation.context, 0, bitmap_data, false).into();
+            let display_object = Bitmap::new_with_bitmap_data(
+                activation.context.gc_context,
+                0,
+                bitmap_data,
+                false,
+                &activation.caller_movie_or_root(),
+            )
+            .into();
             return initialize_for_allocator(activation, display_object, orig_class);
         }
 
@@ -38,14 +44,18 @@ pub fn bitmap_allocator<'gc>(
             .avm2_class_registry()
             .class_symbol(class)
         {
-            if let Some(Character::Bitmap(bitmap)) = activation
+            if let Some(Character::Bitmap {
+                compressed,
+                avm2_bitmapdata_class: _,
+                handle: _,
+            }) = activation
                 .context
                 .library
                 .library_for_movie_mut(movie)
                 .character_by_id(symbol)
                 .cloned()
             {
-                let new_bitmap_data = fill_bitmap_data_from_symbol(activation, &bitmap);
+                let new_bitmap_data = fill_bitmap_data_from_symbol(activation, &compressed);
                 let bitmap_data_obj = BitmapDataObject::from_bitmap_data_internal(
                     activation,
                     BitmapDataWrapper::dummy(activation.context.gc_context),
@@ -55,14 +65,14 @@ pub fn bitmap_allocator<'gc>(
                 new_bitmap_data.init_object2(activation.context.gc_context, bitmap_data_obj);
 
                 let child = Bitmap::new_with_bitmap_data(
-                    &mut activation.context,
+                    activation.context.gc_context,
                     0,
                     new_bitmap_data,
                     false,
-                )
-                .into();
+                    &activation.caller_movie_or_root(),
+                );
 
-                let obj = initialize_for_allocator(activation, child, orig_class)?;
+                let obj = initialize_for_allocator(activation, child.into(), orig_class)?;
                 obj.set_public_property("bitmapData", bitmap_data_obj.into(), activation)?;
                 return Ok(obj);
             }

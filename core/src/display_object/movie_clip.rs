@@ -15,24 +15,23 @@ use bitflags::bitflags;
 use crate::avm1::Avm1;
 use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::binary_data::BinaryData;
-use crate::character::Character;
+use crate::character::{Character, CompressedBitmap};
 use crate::context::{ActionType, RenderContext, UpdateContext};
-use crate::display_object::container::{
-    dispatch_removed_event, ChildContainer, TDisplayObjectContainer,
-};
+use crate::context_stub;
+use crate::display_object::container::{dispatch_removed_event, ChildContainer};
 use crate::display_object::interactive::{
     InteractiveObject, InteractiveObjectBase, TInteractiveObject,
 };
 use crate::display_object::{
-    Avm1Button, Avm2Button, Bitmap, DisplayObjectBase, DisplayObjectPtr, EditText, Graphic,
-    MorphShape, TDisplayObject, Text, Video,
+    Avm1Button, Avm2Button, DisplayObjectBase, DisplayObjectPtr, EditText, Graphic, MorphShape,
+    Text, Video,
 };
 use crate::drawing::Drawing;
 use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult};
 use crate::font::{Font, FontType};
 use crate::limits::ExecutionLimit;
-use crate::loader;
 use crate::loader::Loader;
+use crate::loader::{self, ContentType};
 use crate::prelude::*;
 use crate::streams::NetStream;
 use crate::string::{AvmString, SwfStrExt as _, WStr, WString};
@@ -41,14 +40,16 @@ use crate::vminterface::{AvmObject, Instantiator};
 use core::fmt;
 use gc_arena::{Collect, Gc, GcCell, GcWeakCell, Mutation};
 use smallvec::SmallVec;
-use std::cell::{Ref, RefMut};
+use std::borrow::Cow;
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use swf::extensions::ReadSwfExt;
-use swf::{ClipEventFlag, FontFlag, FrameLabelData, SwfStr, TagCode};
+use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode};
 
 use super::interactive::Avm2MousePick;
+use super::BitmapClass;
 
 type FrameNumber = u16;
 
@@ -158,10 +159,8 @@ pub struct MovieClipData<'gc> {
     frame_scripts: Vec<Option<Avm2Object<'gc>>>,
     #[collect(require_static)]
     flags: MovieClipFlags,
-    avm2_class: Option<Avm2ClassObject<'gc>>,
     #[collect(require_static)]
     drawing: Drawing,
-    has_focus: bool,
     avm2_enabled: bool,
 
     /// Show a hand cursor when the clip is in button mode.
@@ -196,19 +195,20 @@ impl<'gc> MovieClip<'gc> {
             gc_context,
             MovieClipData {
                 base: Default::default(),
-                static_data: Gc::new(gc_context, MovieClipStatic::empty(movie, gc_context)),
+                static_data: Gc::new(
+                    gc_context,
+                    MovieClipStatic::empty(movie.clone(), gc_context),
+                ),
                 tag_stream_pos: 0,
                 current_frame: 0,
                 audio_stream: None,
-                container: ChildContainer::new(),
+                container: ChildContainer::new(movie),
                 object: None,
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::empty(),
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -232,23 +232,24 @@ impl<'gc> MovieClip<'gc> {
         class: Avm2ClassObject<'gc>,
         gc_context: &Mutation<'gc>,
     ) -> Self {
-        MovieClip(GcCell::new(
+        let clip = MovieClip(GcCell::new(
             gc_context,
             MovieClipData {
                 base: Default::default(),
-                static_data: Gc::new(gc_context, MovieClipStatic::empty(movie, gc_context)),
+                static_data: Gc::new(
+                    gc_context,
+                    MovieClipStatic::empty(movie.clone(), gc_context),
+                ),
                 tag_stream_pos: 0,
                 current_frame: 0,
                 audio_stream: None,
-                container: ChildContainer::new(),
+                container: ChildContainer::new(movie),
                 object: Some(this.into()),
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::empty(),
-                avm2_class: Some(class),
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -263,7 +264,9 @@ impl<'gc> MovieClip<'gc> {
                 queued_tags: HashMap::new(),
                 attached_audio: None,
             },
-        ))
+        ));
+        clip.set_avm2_class(gc_context, Some(class));
+        clip
     }
 
     /// Constructs a non-root movie
@@ -279,20 +282,18 @@ impl<'gc> MovieClip<'gc> {
                 base: Default::default(),
                 static_data: Gc::new(
                     gc_context,
-                    MovieClipStatic::with_data(id, swf, num_frames, None, gc_context),
+                    MovieClipStatic::with_data(id, swf.clone(), num_frames, None, gc_context),
                 ),
                 tag_stream_pos: 0,
                 current_frame: 0,
                 audio_stream: None,
-                container: ChildContainer::new(),
+                container: ChildContainer::new(swf.movie),
                 object: None,
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::PLAYING,
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -325,10 +326,13 @@ impl<'gc> MovieClip<'gc> {
         let loader_info = if movie.is_action_script_3() {
             // The root movie doesn't have a `Loader`
             // We will replace this with a `LoaderStream::Swf` later in this function
-            Some(
+            let loader_info =
                 LoaderInfoObject::not_yet_loaded(activation, movie.clone(), None, None, false)
-                    .expect("Failed to construct LoaderInfoObject"),
-            )
+                    .expect("Failed to construct LoaderInfoObject");
+            let loader_info_obj = loader_info.as_loader_info_object().unwrap();
+            loader_info_obj.set_expose_content(activation.context.gc_context);
+            loader_info_obj.set_content_type(ContentType::Swf, activation.context.gc_context);
+            Some(loader_info)
         } else {
             None
         };
@@ -350,15 +354,13 @@ impl<'gc> MovieClip<'gc> {
                 tag_stream_pos: 0,
                 current_frame: 0,
                 audio_stream: None,
-                container: ChildContainer::new(),
+                container: ChildContainer::new(movie.clone()),
                 object: None,
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
                 flags: MovieClipFlags::PLAYING,
-                avm2_class: None,
                 drawing: Drawing::new(),
-                has_focus: false,
                 avm2_enabled: true,
                 avm2_use_hand_cursor: true,
                 button_mode: false,
@@ -376,17 +378,18 @@ impl<'gc> MovieClip<'gc> {
         ));
 
         if movie.is_action_script_3() {
-            mc.0.read()
+            let mc_data = mc.0.read();
+            let loader_info = mc_data
                 .static_data
                 .loader_info
                 .as_ref()
                 .unwrap()
                 .as_loader_info_object()
-                .unwrap()
-                .set_loader_stream(
-                    LoaderStream::Swf(movie, mc.into()),
-                    activation.context.gc_context,
-                );
+                .unwrap();
+            loader_info.set_loader_stream(
+                LoaderStream::Swf(movie, mc.into()),
+                activation.context.gc_context,
+            );
         }
         mc.set_is_root(activation.context.gc_context, true);
         mc
@@ -420,7 +423,7 @@ impl<'gc> MovieClip<'gc> {
             context.gc_context,
             MovieClipStatic::with_data(
                 0,
-                movie.into(),
+                movie.clone().into(),
                 total_frames,
                 loader_info.map(|l| l.into()),
                 context.gc_context,
@@ -431,7 +434,7 @@ impl<'gc> MovieClip<'gc> {
         mc.base.base.set_is_root(is_root);
         mc.current_frame = 0;
         mc.audio_stream = None;
-        mc.container = ChildContainer::new();
+        mc.container = ChildContainer::new(movie);
         drop(mc);
     }
 
@@ -692,6 +695,14 @@ impl<'gc> MovieClip<'gc> {
                     .0
                     .write(context.gc_context)
                     .define_binary_data(context, reader),
+                TagCode::ImportAssets => self
+                    .0
+                    .write(context.gc_context)
+                    .import_assets(context, reader),
+                TagCode::ImportAssets2 => self
+                    .0
+                    .write(context.gc_context)
+                    .import_assets_2(context, reader),
                 TagCode::End => {
                     end_tag_found = true;
                     return Ok(ControlFlow::Exit);
@@ -756,7 +767,7 @@ impl<'gc> MovieClip<'gc> {
         reader: &mut SwfStream<'_>,
         tag_len: usize,
     ) -> Result<(), Error> {
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             tracing::warn!("DoInitAction tag in AVM2 movie");
             return Ok(());
         }
@@ -788,8 +799,8 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'_, 'gc>,
         reader: &mut SwfStream<'_>,
     ) -> Result<(), Error> {
-        if !context.is_action_script_3() {
-            tracing::warn!("DoABC tag in AVM1 movie");
+        if !context.swf.is_action_script_3() {
+            tracing::warn!("DoABC tag with non-AVM2 root");
             return Ok(());
         }
 
@@ -820,8 +831,8 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'_, 'gc>,
         reader: &mut SwfStream<'_>,
     ) -> Result<(), Error> {
-        if !context.is_action_script_3() {
-            tracing::warn!("DoABC2 tag in AVM1 movie");
+        if !context.swf.is_action_script_3() {
+            tracing::warn!("DoABC2 tag with non-AVM2 root");
             return Ok(());
         }
 
@@ -916,11 +927,29 @@ impl<'gc> MovieClip<'gc> {
                             Some(Character::BinaryData(_)) => {}
                             Some(Character::Font(_)) => {}
                             Some(Character::Sound(_)) => {}
-                            Some(Character::Bitmap(bitmap)) => {
-                                bitmap.set_avm2_bitmapdata_class(
-                                    &mut activation.context,
+                            Some(Character::Bitmap { .. }) => {
+                                if let Some(bitmap_class) = BitmapClass::from_class_object(
                                     class_object,
-                                );
+                                    &mut activation.context,
+                                ) {
+                                    // We need to re-fetch the library and character to satisfy the borrow checker
+                                    let library = activation
+                                        .context
+                                        .library
+                                        .library_for_movie_mut(movie.clone());
+
+                                    let Some(Character::Bitmap {
+                                        avm2_bitmapdata_class,
+                                        ..
+                                    }) = library.character_by_id(id)
+                                    else {
+                                        unreachable!();
+                                    };
+                                    *avm2_bitmapdata_class.write(activation.context.gc_context) =
+                                        bitmap_class;
+                                } else {
+                                    tracing::error!("Associated class {:?} for symbol {} must extend flash.display.Bitmap or BitmapData, does neither", class_object.inner_class_definition().name(), self.id());
+                                }
                             }
                             _ => {
                                 tracing::warn!(
@@ -1083,7 +1112,7 @@ impl<'gc> MovieClip<'gc> {
             } else {
                 self.run_goto(context, frame, false);
             }
-        } else if context.is_action_script_3() {
+        } else if self.movie().is_action_script_3() {
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }
@@ -1338,18 +1367,17 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_avm2_class(self, gc_context: &Mutation<'gc>, constr: Option<Avm2ClassObject<'gc>>) {
-        let mut write = self.0.write(gc_context);
-        write.avm2_class = constr;
+        *self.0.read().static_data.avm2_class.write(gc_context) = constr;
     }
 
     pub fn frame_label_to_number(
         self,
         frame_label: &WStr,
-        context: &UpdateContext<'_, 'gc>,
+        _context: &UpdateContext<'_, 'gc>,
     ) -> Option<FrameNumber> {
         // In AVM1, frame labels are case insensitive (ASCII).
         // They are case sensitive in AVM2.
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             self.0
                 .read()
                 .static_data
@@ -1487,6 +1515,7 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'_, 'gc>,
         run_display_actions: bool,
         run_sounds: bool,
+        is_action_script_3: bool,
     ) {
         let next_frame = self.determine_next_frame();
         match next_frame {
@@ -1499,7 +1528,7 @@ impl<'gc> MovieClip<'gc> {
                 }
 
                 // AS3 removals need to happen before frame advance (see below)
-                if !context.is_action_script_3() {
+                if !is_action_script_3 {
                     write.current_frame += 1
                 }
             }
@@ -1516,40 +1545,40 @@ impl<'gc> MovieClip<'gc> {
         let tag_callback = |reader: &mut SwfStream<'_>, tag_code, tag_len| {
             match tag_code {
                 TagCode::DoAction => self.do_action(context, reader, tag_len),
-                TagCode::PlaceObject if run_display_actions && !context.is_action_script_3() => {
+                TagCode::PlaceObject if run_display_actions && !is_action_script_3 => {
                     self.place_object(context, reader, 1)
                 }
-                TagCode::PlaceObject2 if run_display_actions && !context.is_action_script_3() => {
+                TagCode::PlaceObject2 if run_display_actions && !is_action_script_3 => {
                     self.place_object(context, reader, 2)
                 }
-                TagCode::PlaceObject3 if run_display_actions && !context.is_action_script_3() => {
+                TagCode::PlaceObject3 if run_display_actions && !is_action_script_3 => {
                     self.place_object(context, reader, 3)
                 }
-                TagCode::PlaceObject4 if run_display_actions && !context.is_action_script_3() => {
+                TagCode::PlaceObject4 if run_display_actions && !is_action_script_3 => {
                     self.place_object(context, reader, 4)
                 }
-                TagCode::RemoveObject if run_display_actions && !context.is_action_script_3() => {
+                TagCode::RemoveObject if run_display_actions && !is_action_script_3 => {
                     self.remove_object(context, reader, 1)
                 }
-                TagCode::RemoveObject2 if run_display_actions && !context.is_action_script_3() => {
+                TagCode::RemoveObject2 if run_display_actions && !is_action_script_3 => {
                     self.remove_object(context, reader, 2)
                 }
-                TagCode::PlaceObject if run_display_actions && context.is_action_script_3() => {
+                TagCode::PlaceObject if run_display_actions && is_action_script_3 => {
                     self.queue_place_object(context, reader, 1)
                 }
-                TagCode::PlaceObject2 if run_display_actions && context.is_action_script_3() => {
+                TagCode::PlaceObject2 if run_display_actions && is_action_script_3 => {
                     self.queue_place_object(context, reader, 2)
                 }
-                TagCode::PlaceObject3 if run_display_actions && context.is_action_script_3() => {
+                TagCode::PlaceObject3 if run_display_actions && is_action_script_3 => {
                     self.queue_place_object(context, reader, 3)
                 }
-                TagCode::PlaceObject4 if run_display_actions && context.is_action_script_3() => {
+                TagCode::PlaceObject4 if run_display_actions && is_action_script_3 => {
                     self.queue_place_object(context, reader, 4)
                 }
-                TagCode::RemoveObject if run_display_actions && context.is_action_script_3() => {
+                TagCode::RemoveObject if run_display_actions && is_action_script_3 => {
                     self.queue_remove_object(context, reader, 1)
                 }
-                TagCode::RemoveObject2 if run_display_actions && context.is_action_script_3() => {
+                TagCode::RemoveObject2 if run_display_actions && is_action_script_3 => {
                     self.queue_remove_object(context, reader, 2)
                 }
                 TagCode::SetBackgroundColor => self.set_background_color(context, reader),
@@ -1597,7 +1626,7 @@ impl<'gc> MovieClip<'gc> {
             }
         }
 
-        if matches!(next_frame, NextFrame::Next) && context.is_action_script_3() {
+        if matches!(next_frame, NextFrame::Next) && is_action_script_3 {
             write.current_frame += 1;
         }
 
@@ -1914,7 +1943,7 @@ impl<'gc> MovieClip<'gc> {
                                 params: &GotoPlaceObject<'_>| {
             use swf::PlaceObjectAction;
             let child_entry = clip.child_by_depth(params.depth());
-            if context.is_action_script_3() && is_implicit && child_entry.is_none() {
+            if self.movie().is_action_script_3() && is_implicit && child_entry.is_none() {
                 // Looping gotos do not run their PlaceObject commands at goto
                 // time. They are instead held to frameConstructed like normal
                 // playback.
@@ -1995,7 +2024,12 @@ impl<'gc> MovieClip<'gc> {
             // However, if we executed a 'no-op goto' (start and end frames are the same),
             // then do *not* run sounds. Some SWFS (e.g. 'This is the only level too')
             // rely on this behavior.
-            self.run_frame_internal(context, false, frame != frame_before_rewind);
+            self.run_frame_internal(
+                context,
+                false,
+                frame != frame_before_rewind,
+                self.movie().is_action_script_3(),
+            );
         } else {
             self.0.write(context.gc_context).current_frame = clamped_frame;
         }
@@ -2154,7 +2188,9 @@ impl<'gc> MovieClip<'gc> {
         let class_object = self
             .0
             .read()
+            .static_data
             .avm2_class
+            .read()
             .unwrap_or_else(|| context.avm2.classes().movieclip);
 
         let mut constr_thing = || {
@@ -2184,7 +2220,9 @@ impl<'gc> MovieClip<'gc> {
         let class_object = self
             .0
             .read()
+            .static_data
             .avm2_class
+            .read()
             .unwrap_or_else(|| context.avm2.classes().movieclip);
 
         if let Avm2Value::Object(object) = self.object2() {
@@ -2202,7 +2240,7 @@ impl<'gc> MovieClip<'gc> {
                     e,
                     class_object
                         .try_inner_class_definition()
-                        .map(|c| c.read().name().to_qualified_name(context.gc_context))
+                        .map(|c| c.name().to_qualified_name(context.gc_context))
                         .unwrap_or_else(|_| "[BorrowError!]".into())
                 );
             }
@@ -2277,36 +2315,9 @@ impl<'gc> MovieClip<'gc> {
         Ok(())
     }
 
-    /// Retrieve a named property from the AVM1 object.
-    ///
-    /// This is required as some boolean properties in AVM1 can in fact hold any value.
-    fn get_avm1_boolean_property(
-        self,
-        context: &mut UpdateContext<'_, 'gc>,
-        name: &'static str,
-        default: bool,
-    ) -> bool {
-        if let Avm1Value::Object(object) = self.object() {
-            let mut activation = Avm1Activation::from_stub(
-                context.reborrow(),
-                ActivationIdentifier::root("[AVM1 Boolean Property]"),
-            );
-            if let Ok(value) = object.get(name, &mut activation) {
-                match value {
-                    Avm1Value::Undefined => default,
-                    _ => value.as_bool(activation.swf_version()),
-                }
-            } else {
-                default
-            }
-        } else {
-            false
-        }
-    }
-
     fn enabled(self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        if !context.is_action_script_3() {
-            self.get_avm1_boolean_property(context, "enabled", true)
+        if !self.movie().is_action_script_3() {
+            self.get_avm1_boolean_property(context, "enabled", |_| true)
         } else {
             self.avm2_enabled()
         }
@@ -2321,8 +2332,8 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn use_hand_cursor(self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        if !context.is_action_script_3() {
-            self.get_avm1_boolean_property(context, "useHandCursor", true)
+        if !self.movie().is_action_script_3() {
+            self.get_avm1_boolean_property(context, "useHandCursor", |_| true)
         } else {
             self.avm2_use_hand_cursor()
         }
@@ -2382,9 +2393,10 @@ impl<'gc> MovieClip<'gc> {
         } else {
             let object = self.object();
             if let Avm1Value::Object(object) = object {
-                let mut activation = Avm1Activation::from_stub(
+                let mut activation = Avm1Activation::from_nothing(
                     context.reborrow(),
                     ActivationIdentifier::root("[Mouse Pick]"),
+                    self.avm1_root(),
                 );
 
                 ClipEvent::BUTTON_EVENT_METHODS
@@ -2592,11 +2604,11 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             return;
         }
 
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             let is_playing = self.playing();
 
             if is_playing {
-                self.run_frame_internal(context, true, true);
+                self.run_frame_internal(context, true, true, true);
             }
 
             // PlaceObject tags execute at this time.
@@ -2623,7 +2635,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn construct_frame(&self, context: &mut UpdateContext<'_, 'gc>) {
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
-        if context.is_action_script_3() && self.frames_loaded() >= 1 {
+        if self.movie().is_action_script_3()
+            && (self.frames_loaded() >= 1 || self.total_frames() == 0)
+        {
             let is_load_frame = !self.0.read().initialized();
             let needs_construction = if matches!(self.object2(), Avm2Value::Null) {
                 self.allocate_as_avm2_object(context, (*self).into());
@@ -2663,7 +2677,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_avm1(&self, context: &mut UpdateContext<'_, 'gc>) {
-        if !context.is_action_script_3() {
+        if !self.movie().is_action_script_3() {
             // Run my load/enterFrame clip event.
             let is_load_frame = !self.0.read().flags.contains(MovieClipFlags::INITIALIZED);
             if is_load_frame {
@@ -2676,7 +2690,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             // Run my SWF tags.
             // In AVM2, SWF tags are processed at enterFrame time.
             if self.playing() {
-                self.run_frame_internal(context, true, true);
+                self.run_frame_internal(context, true, true, false);
             }
         }
     }
@@ -2864,9 +2878,23 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         instantiated_by: Instantiator,
         run_frame: bool,
     ) {
+        if self
+            .0
+            .write(context.gc_context)
+            .flags
+            .contains(MovieClipFlags::POST_INSTANTIATED)
+        {
+            // Ensure that the same clip doesn't get post-instantiated twice.
+            return;
+        }
+        self.0
+            .write(context.gc_context)
+            .flags
+            .insert(MovieClipFlags::POST_INSTANTIATED);
+
         self.set_default_instance_name(context);
 
-        if !context.is_action_script_3() {
+        if !self.movie().is_action_script_3() {
             context
                 .avm1
                 .add_to_exec_list(context.gc_context, (*self).into());
@@ -2900,13 +2928,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         }
     }
 
-    fn set_parent(&self, context: &mut UpdateContext<'_, 'gc>, parent: Option<DisplayObject<'gc>>) {
-        let had_parent = self.parent().is_some();
-        self.base_mut(context.gc_context)
-            .set_parent_ignoring_orphan_list(parent);
-        let has_parent = self.parent().is_some();
-
-        if context.is_action_script_3() && had_parent && !has_parent {
+    fn on_parent_removed(&self, context: &mut UpdateContext<'_, 'gc>) {
+        if self.movie().is_action_script_3() {
             context.avm2.add_orphan_obj((*self).into())
         }
     }
@@ -2929,11 +2952,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             }
         }
 
-        let had_focus = self.0.read().has_focus;
-        if had_focus {
-            let tracker = context.focus_tracker;
-            tracker.set(None, context);
-        }
+        self.drop_focus(context);
 
         {
             let mut mc = self.0.write(context.gc_context);
@@ -2955,22 +2974,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn allow_as_mask(&self) -> bool {
         !self.is_empty()
     }
-
-    fn is_focusable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        if !context.is_action_script_3() {
-            if self.is_button_mode(context) {
-                true
-            } else {
-                self.get_avm1_boolean_property(context, "focusEnabled", false)
-            }
-        } else {
-            false
-        }
-    }
-
-    fn on_focus_changed(&self, gc_context: &Mutation<'gc>, focused: bool) {
-        self.0.write(gc_context).has_focus = focused;
-    }
 }
 
 impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
@@ -2980,6 +2983,10 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
 
     fn raw_container_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
         RefMut::map(self.0.write(gc_context), |this| &mut this.container)
+    }
+
+    fn is_tab_children_avm1(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        self.get_avm1_boolean_property(context, "tabChildren", |_| true)
     }
 }
 
@@ -3069,20 +3076,17 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
                 // Queue ActionScript-defined event handlers after the SWF defined ones.
                 // (e.g., clip.onEnterFrame = foo).
-                if swf_version >= 6 {
+                if self.should_fire_event_handlers(context, event) {
                     if let Some(name) = event.method_name() {
-                        // Keyboard events don't fire their methods unless the MovieClip has focus (#2120).
-                        if !event.is_key_event() || read.has_focus {
-                            context.action_queue.queue_action(
-                                self.into(),
-                                ActionType::Method {
-                                    object,
-                                    name,
-                                    args: vec![],
-                                },
-                                event == ClipEvent::Unload,
-                            );
-                        }
+                        context.action_queue.queue_action(
+                            self.into(),
+                            ActionType::Method {
+                                object,
+                                name,
+                                args: vec![],
+                            },
+                            event == ClipEvent::Unload,
+                        );
                     }
                 }
             }
@@ -3097,11 +3101,14 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
+        // Don't do anything if run in an AVM2 context.
+        if self.movie().is_action_script_3() {
+            return None;
+        }
+
         if self.visible() {
             let this: InteractiveObject<'gc> = (*self).into();
-            let Some(local_matrix) = self.global_to_local_matrix() else {
-                return None;
-            };
+            let local_matrix = self.global_to_local_matrix()?;
 
             if let Some(masker) = self.masker() {
                 // FIXME - should this really use `SKIP_INVISIBLE`? Avm2 doesn't.
@@ -3149,7 +3156,17 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                     }
                 } else if result.is_none() {
                     if let Some(child) = child.as_interactive() {
-                        result = child.mouse_pick_avm1(context, point, require_button_mode);
+                        result = if !child.as_displayobject().movie().is_action_script_3() {
+                            child.mouse_pick_avm1(context, point, require_button_mode)
+                        } else {
+                            let avm2_result =
+                                child.mouse_pick_avm2(context, point, require_button_mode);
+                            if let Avm2MousePick::Hit(result) = avm2_result {
+                                Some(result)
+                            } else {
+                                None
+                            }
+                        }
                     } else if check_non_interactive
                         && self.mouse_enabled()
                         && child.hit_test_shape(context, point, options)
@@ -3185,6 +3202,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        // Don't do anything if run in an AVM1 context.
+        if !self.movie().is_action_script_3() {
+            return Avm2MousePick::Miss;
+        }
+
         if self.visible() {
             let this: InteractiveObject<'gc> = (*self).into();
             let Some(local_matrix) = self.global_to_local_matrix() else {
@@ -3238,12 +3260,22 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             for child in interactive.into_iter().chain(non_interactive) {
                 // Mask children are not clickable
-                if child.clip_depth() > 0 {
+                if child.clip_depth() > 0 || child.maskee().is_some() {
                     continue;
                 }
 
                 let mut res = if let Some(child) = child.as_interactive() {
-                    child.mouse_pick_avm2(context, point, require_button_mode)
+                    if child.as_displayobject().movie().is_action_script_3() {
+                        child.mouse_pick_avm2(context, point, require_button_mode)
+                    } else {
+                        let avm1_result =
+                            child.mouse_pick_avm1(context, point, require_button_mode);
+                        if let Some(result) = avm1_result {
+                            Avm2MousePick::Hit(result)
+                        } else {
+                            Avm2MousePick::Miss
+                        }
+                    }
                 } else if child.as_interactive().is_none()
                     && child.hit_test_shape(context, point, options)
                 {
@@ -3315,6 +3347,43 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         } else {
             MouseCursor::Arrow
         }
+    }
+
+    fn is_focusable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_root() {
+            false
+        } else if self.is_button_mode(context) {
+            true
+        } else {
+            self.get_avm1_boolean_property(context, "focusEnabled", |_| false)
+        }
+    }
+
+    fn is_highlightable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        // Root movie clips are not highlightable.
+        // This applies only to AVM2, as in AVM1 they are also not focusable.
+        !self.is_root() && self.is_highlight_enabled(context)
+    }
+
+    fn is_tabbable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_root() {
+            // Root movie clips are never tabbable.
+            return false;
+        }
+        self.tab_enabled(context)
+    }
+
+    fn tab_enabled_default(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_button_mode(context) {
+            return true;
+        }
+
+        let is_avm1 = !context.swf.is_action_script_3();
+        if is_avm1 && self.tab_index().is_some() {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -3476,12 +3545,24 @@ impl<'gc, 'a> MovieClipData<'gc> {
         version: u8,
     ) -> Result<(), Error> {
         let define_bits_lossless = reader.read_define_bits_lossless(version)?;
-        let bitmap = ruffle_render::utils::decode_define_bits_lossless(&define_bits_lossless)?;
-        let bitmap = Bitmap::new(context, define_bits_lossless.id, bitmap)?;
         context
             .library
             .library_for_movie_mut(self.movie())
-            .register_character(define_bits_lossless.id, Character::Bitmap(bitmap));
+            .register_character(
+                define_bits_lossless.id,
+                Character::Bitmap {
+                    compressed: CompressedBitmap::Lossless(DefineBitsLossless {
+                        id: define_bits_lossless.id,
+                        format: define_bits_lossless.format,
+                        width: define_bits_lossless.width,
+                        height: define_bits_lossless.height,
+                        version: define_bits_lossless.version,
+                        data: Cow::Owned(define_bits_lossless.data.into_owned()),
+                    }),
+                    handle: RefCell::new(None),
+                    avm2_bitmapdata_class: GcCell::new(context.gc_context, BitmapClass::NoSubclass),
+                },
+            );
         Ok(())
     }
 
@@ -3611,13 +3692,25 @@ impl<'gc, 'a> MovieClipData<'gc> {
             .library
             .library_for_movie_mut(self.movie())
             .jpeg_tables();
-        let jpeg_data = ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, jpeg_tables);
-        let bitmap = ruffle_render::utils::decode_define_bits_jpeg(&jpeg_data, None)?;
-        let bitmap = Bitmap::new(context, id, bitmap)?;
+        let jpeg_data =
+            ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, jpeg_tables).into_owned();
+        let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(&jpeg_data)?;
         context
             .library
             .library_for_movie_mut(self.movie())
-            .register_character(id, Character::Bitmap(bitmap));
+            .register_character(
+                id,
+                Character::Bitmap {
+                    compressed: CompressedBitmap::Jpeg {
+                        data: jpeg_data,
+                        alpha: None,
+                        width,
+                        height,
+                    },
+                    handle: RefCell::new(None),
+                    avm2_bitmapdata_class: GcCell::new(context.gc_context, BitmapClass::NoSubclass),
+                },
+            );
         Ok(())
     }
 
@@ -3629,12 +3722,23 @@ impl<'gc, 'a> MovieClipData<'gc> {
     ) -> Result<(), Error> {
         let id = reader.read_u16()?;
         let jpeg_data = reader.read_slice_to_end();
-        let bitmap = ruffle_render::utils::decode_define_bits_jpeg(jpeg_data, None)?;
-        let bitmap = Bitmap::new(context, id, bitmap)?;
+        let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(jpeg_data)?;
         context
             .library
             .library_for_movie_mut(self.movie())
-            .register_character(id, Character::Bitmap(bitmap));
+            .register_character(
+                id,
+                Character::Bitmap {
+                    compressed: CompressedBitmap::Jpeg {
+                        data: jpeg_data.to_vec(),
+                        alpha: None,
+                        width,
+                        height,
+                    },
+                    handle: RefCell::new(None),
+                    avm2_bitmapdata_class: GcCell::new(context.gc_context, BitmapClass::NoSubclass),
+                },
+            );
         Ok(())
     }
 
@@ -3652,12 +3756,23 @@ impl<'gc, 'a> MovieClipData<'gc> {
         }
         let jpeg_data = reader.read_slice(jpeg_len)?;
         let alpha_data = reader.read_slice_to_end();
-        let bitmap = ruffle_render::utils::decode_define_bits_jpeg(jpeg_data, Some(alpha_data))?;
-        let bitmap = Bitmap::new(context, id, bitmap)?;
+        let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(jpeg_data)?;
         context
             .library
             .library_for_movie_mut(self.movie())
-            .register_character(id, Character::Bitmap(bitmap));
+            .register_character(
+                id,
+                Character::Bitmap {
+                    compressed: CompressedBitmap::Jpeg {
+                        data: jpeg_data.to_owned(),
+                        alpha: Some(alpha_data.to_owned()),
+                        width,
+                        height,
+                    },
+                    handle: RefCell::new(None),
+                    avm2_bitmapdata_class: GcCell::new(context.gc_context, BitmapClass::NoSubclass),
+                },
+            );
         Ok(())
     }
 
@@ -3722,7 +3837,7 @@ impl<'gc, 'a> MovieClipData<'gc> {
             .character_by_id(button_colors.id)
         {
             Some(Character::Avm1Button(button)) => {
-                button.set_colors(context.gc_context, &button_colors.color_transforms[..]);
+                button.set_colors(&button_colors.color_transforms);
             }
             Some(_) => {
                 tracing::warn!(
@@ -3753,10 +3868,10 @@ impl<'gc, 'a> MovieClipData<'gc> {
             .character_by_id(button_sounds.id)
         {
             Some(Character::Avm1Button(button)) => {
-                button.set_sounds(context.gc_context, button_sounds);
+                button.set_sounds(button_sounds);
             }
             Some(Character::Avm2Button(button)) => {
-                button.set_sounds(context.gc_context, button_sounds);
+                button.set_sounds(button_sounds);
             }
             Some(_) => {
                 tracing::warn!(
@@ -3883,29 +3998,13 @@ impl<'gc, 'a> MovieClipData<'gc> {
         context: &mut UpdateContext<'_, 'gc>,
         reader: &mut SwfStream<'a>,
     ) -> Result<(), Error> {
-        tracing::warn!("DefineFont4 tag (TLF text) is not implemented");
         let font = reader.read_define_font_4()?;
         let font_id = font.id;
-        let font_object = Font::from_swf_tag(
-            context.gc_context,
-            context.renderer,
-            swf::Font {
-                version: 4,
-                id: font.id,
-                name: SwfStr::from_bytes(b"<Unknown Font4>"),
-                language: swf::Language::Unknown,
-                layout: None,
-                glyphs: Vec::new(),
-                flags: FontFlag::empty(),
-            },
-            reader.encoding(),
-            FontType::EmbeddedCFF,
-        );
+        let font_object = Font::from_font4_tag(context.gc_context, font, reader.encoding())?;
         context
             .library
             .library_for_movie_mut(self.movie())
             .register_character(font_id, Character::Font(font_object));
-
         Ok(())
     }
 
@@ -4026,6 +4125,28 @@ impl<'gc, 'a> MovieClipData<'gc> {
     }
 
     #[inline]
+    fn import_assets(
+        &mut self,
+        context: &mut UpdateContext<'_, 'gc>,
+        _reader: &mut SwfStream<'a>,
+    ) -> Result<(), Error> {
+        context_stub!(context, "ImportAssets tag");
+
+        Ok(())
+    }
+
+    #[inline]
+    fn import_assets_2(
+        &mut self,
+        context: &mut UpdateContext<'_, 'gc>,
+        _reader: &mut SwfStream<'a>,
+    ) -> Result<(), Error> {
+        context_stub!(context, "ImportAssets2 tag");
+
+        Ok(())
+    }
+
+    #[inline]
     fn script_limits(
         &mut self,
         reader: &mut SwfStream<'a>,
@@ -4079,7 +4200,7 @@ impl<'gc, 'a> MovieClipData<'gc> {
         reader: &mut SwfStream<'a>,
         cur_frame: FrameNumber,
         static_data: &mut MovieClipStatic<'gc>,
-        context: &UpdateContext<'_, 'gc>,
+        _context: &UpdateContext<'_, 'gc>,
     ) -> Result<(), Error> {
         // This tag is ignored if scene labels exist.
         if !static_data.scene_labels.is_empty() {
@@ -4090,7 +4211,7 @@ impl<'gc, 'a> MovieClipData<'gc> {
         let mut label = frame_label.label.decode(reader.encoding()).into_owned();
 
         // In AVM1, frame labels are case insensitive (ASCII), but in AVM2 they are case sensitive.
-        if !context.is_action_script_3() {
+        if !self.movie().is_action_script_3() {
             label.make_ascii_lowercase();
         }
 
@@ -4166,7 +4287,7 @@ impl<'gc, 'a> MovieClip<'gc> {
         reader: &mut SwfStream<'a>,
         tag_len: usize,
     ) -> Result<(), Error> {
-        if context.is_action_script_3() {
+        if self.movie().is_action_script_3() {
             tracing::warn!("DoAction tag in AVM2 movie");
             return Ok(());
         }
@@ -4494,6 +4615,7 @@ struct MovieClipStatic<'gc> {
     /// The last known symbol name under which this movie clip was exported.
     /// Used for looking up constructors registered with `Object.registerClass`.
     exported_name: GcCell<'gc, Option<AvmString<'gc>>>,
+    avm2_class: GcCell<'gc, Option<Avm2ClassObject<'gc>>>,
     /// Only set if this MovieClip is the root movie in an SWF
     /// (either the root SWF initially loaded by the player,
     /// or an SWF dynamically loaded by `Loader`)
@@ -4540,6 +4662,7 @@ impl<'gc> MovieClipStatic<'gc> {
             audio_stream_info: None,
             audio_stream_handle: None,
             exported_name: GcCell::new(gc_context, None),
+            avm2_class: GcCell::new(gc_context, None),
             loader_info,
             preload_progress: GcCell::new(gc_context, Default::default()),
             processed_bytecode_tags_pos: GcCell::new(gc_context, -1),
@@ -4783,6 +4906,9 @@ bitflags! {
         const LOOP_QUEUED = 1 << 4;
 
         const RUNNING_CONSTRUCT_FRAME = 1 << 5;
+
+        /// Whether this `MovieClip` has been post-instantiated yet.
+        const POST_INSTANTIATED = 1 << 5;
     }
 }
 

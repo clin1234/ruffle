@@ -1,0 +1,17 @@
+preferences-dialog = Ruffleの設定
+preference-locked-by-cli = 読み取り専用 (CLIによる設定)
+graphics-backend = グラフィック バックエンド
+graphics-backend-default = デフォルト
+graphics-power = 電源設定
+graphics-power-low = 低(iGPU等の場合)
+graphics-power-high = 高(GPU等の場合)
+language = 言語
+audio-output-device = オーディオ出力デバイス
+audio-output-device-default = システムのデフォルト
+log-filename-pattern = ログファイル名
+log-filename-pattern-single-file = 単一ファイル（ruffle.log）
+log-filename-pattern-with-timestamp = タイムスタンプ付き
+storage-backend = セーブファイルの場所
+storage-backend-disk = ディスク
+storage-backend-memory = メモリ
+recent-limit = 履歴の保存上限

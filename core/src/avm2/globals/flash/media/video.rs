@@ -12,7 +12,7 @@ pub fn video_allocator<'gc>(
     let mut target_class = Some(class);
     while let Some(target) = target_class {
         if target == video_class {
-            let movie = activation.context.swf.clone();
+            let movie = activation.caller_movie_or_root();
             let new_do = Video::new(activation.context.gc_context, movie, 0, 0, None);
             return initialize_for_allocator(activation, new_do.into(), class);
         }
@@ -69,7 +69,7 @@ pub fn attach_net_stream<'gc>(
                 "Cannot use value of type {:?} as video source",
                 source
                     .and_then(|o| o.instance_of_class_definition())
-                    .map(|c| c.read().name().local_name())
+                    .map(|c| c.name().local_name())
                     .unwrap_or_else(|| "Object".into())
             )
             .into());

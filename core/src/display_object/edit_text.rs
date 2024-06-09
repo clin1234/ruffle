@@ -17,10 +17,10 @@ use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::interactive::{
     InteractiveObject, InteractiveObjectBase, TInteractiveObject,
 };
-use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
+use crate::display_object::{DisplayObjectBase, DisplayObjectPtr};
 use crate::drawing::Drawing;
 use crate::events::{ClipEvent, ClipEventResult, TextControlCode};
-use crate::font::{round_down_to_pixel, Glyph, TextRenderSettings};
+use crate::font::{round_down_to_pixel, FontType, Glyph, TextRenderSettings};
 use crate::html::{
     BoxBounds, FormatSpans, LayoutBox, LayoutContent, LayoutMetrics, Position, TextFormat,
 };
@@ -28,14 +28,19 @@ use crate::prelude::*;
 use crate::string::{utils as string_utils, AvmString, SwfStrExt as _, WStr, WString};
 use crate::tag_utils::SwfMovie;
 use crate::vminterface::{AvmObject, Instantiator};
+use chrono::DateTime;
 use chrono::Utc;
 use core::fmt;
 use gc_arena::{Collect, Gc, GcCell, Mutation};
 use ruffle_render::commands::CommandHandler;
 use ruffle_render::shape_utils::DrawCommand;
 use ruffle_render::transform::Transform;
+use ruffle_wstr::WStrToUtf8;
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::{cell::Ref, cell::RefMut, sync::Arc};
-use swf::{Color, ColorTransform, Twips};
+use swf::ColorTransform;
+use unic_segment::WordBoundIndices;
 
 use super::interactive::Avm2MousePick;
 
@@ -162,12 +167,19 @@ pub struct EditTextData<'gc> {
     /// Doesn't affect script-triggered modifications.
     max_chars: i32,
 
+    /// Indicates if the text is scrollable using the mouse wheel.
+    mouse_wheel_enabled: bool,
+
     /// Flags indicating the text field's settings.
     #[collect(require_static)]
     flags: EditTextFlag,
 
     /// Whether this EditText represents an AVM2 TextLine.
     is_tlf: bool,
+
+    /// Restrict what characters the user may input.
+    #[collect(require_static)]
+    restrict: EditTextRestrict,
 }
 
 impl<'gc> EditTextData<'gc> {
@@ -235,6 +247,9 @@ fn get_line_data(layout: &[LayoutBox]) -> Vec<LineData> {
 }
 
 impl<'gc> EditText<'gc> {
+    // This seems to be OS-independent
+    const INPUT_NEWLINE: char = '\r';
+
     /// Creates a new `EditText` from an SWF `DefineEditText` tag.
     pub fn from_swf_tag(
         context: &mut UpdateContext<'_, 'gc>,
@@ -246,7 +261,12 @@ impl<'gc> EditText<'gc> {
         let text = swf_tag.initial_text().unwrap_or_default().decode(encoding);
 
         let mut text_spans = if swf_tag.is_html() {
-            FormatSpans::from_html(&text, default_format, swf_tag.is_multiline())
+            FormatSpans::from_html(
+                &text,
+                default_format,
+                swf_tag.is_multiline(),
+                swf_movie.version(),
+            )
         } else {
             FormatSpans::from_text(text.into_owned(), default_format)
         };
@@ -261,13 +281,19 @@ impl<'gc> EditText<'gc> {
             AutoSizeMode::None
         };
 
+        let font_type = if swf_tag.use_outlines() {
+            FontType::Embedded
+        } else {
+            FontType::Device
+        };
+
         let (layout, intrinsic_bounds) = LayoutBox::lower_from_text_spans(
             &text_spans,
             context,
             swf_movie.clone(),
             swf_tag.bounds().width() - Twips::from_pixels(Self::INTERNAL_PADDING * 2.0),
             swf_tag.is_word_wrap(),
-            !swf_tag.use_outlines(),
+            font_type,
         );
         let line_data = get_line_data(&layout);
 
@@ -333,7 +359,9 @@ impl<'gc> EditText<'gc> {
                 line_data,
                 scroll: 1,
                 max_chars: swf_tag.max_length().unwrap_or_default() as i32,
+                mouse_wheel_enabled: true,
                 is_tlf: false,
+                restrict: EditTextRestrict::allow_all(),
             },
         ));
 
@@ -426,6 +454,7 @@ impl<'gc> EditText<'gc> {
                 text,
                 default_format,
                 write.flags.contains(EditTextFlag::MULTILINE),
+                write.static_data.swf.version(),
             );
             drop(write);
 
@@ -485,6 +514,14 @@ impl<'gc> EditText<'gc> {
             .set(EditTextFlag::READ_ONLY, !is_editable);
     }
 
+    pub fn is_mouse_wheel_enabled(self) -> bool {
+        self.0.read().mouse_wheel_enabled
+    }
+
+    pub fn set_mouse_wheel_enabled(self, is_enabled: bool, context: &mut UpdateContext<'_, 'gc>) {
+        self.0.write(context.gc_context).mouse_wheel_enabled = is_enabled;
+    }
+
     pub fn is_multiline(self) -> bool {
         self.0.read().flags.contains(EditTextFlag::MULTILINE)
     }
@@ -499,6 +536,14 @@ impl<'gc> EditText<'gc> {
             .flags
             .set(EditTextFlag::PASSWORD, is_password);
         self.relayout(context);
+    }
+
+    pub fn restrict(self) -> Option<WString> {
+        return self.0.read().restrict.value().map(Into::into);
+    }
+
+    pub fn set_restrict(self, text: Option<&WStr>, context: &mut UpdateContext<'_, 'gc>) {
+        self.0.write(context.gc_context).restrict = EditTextRestrict::from(text);
     }
 
     pub fn set_multiline(self, is_multiline: bool, context: &mut UpdateContext<'_, 'gc>) {
@@ -743,10 +788,10 @@ impl<'gc> EditText<'gc> {
                 .drawing
                 .draw_command(DrawCommand::LineTo(Point::new(width, Twips::ZERO)));
             write.drawing.draw_command(DrawCommand::LineTo(Point::ZERO));
-
-            drop(write);
-            self.invalidate_cached_bitmap(gc_context);
         }
+
+        drop(write);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     /// Internal padding between the bounds of the EditText and the text.
@@ -781,13 +826,21 @@ impl<'gc> EditText<'gc> {
             edit_text.bounds.width() - padding
         };
 
+        let font_type = if !edit_text.flags.contains(EditTextFlag::USE_OUTLINES) {
+            FontType::Device
+        } else if edit_text.is_tlf {
+            FontType::EmbeddedCFF
+        } else {
+            FontType::Embedded
+        };
+
         let (new_layout, intrinsic_bounds) = LayoutBox::lower_from_text_spans(
             &edit_text.text_spans,
             context,
             movie,
             content_width,
             is_word_wrap,
-            !edit_text.flags.contains(EditTextFlag::USE_OUTLINES),
+            font_type,
         );
 
         edit_text.line_data = get_line_data(&new_layout);
@@ -912,14 +965,29 @@ impl<'gc> EditText<'gc> {
     /// Render a layout box, plus its children.
     fn render_layout_box(self, context: &mut RenderContext<'_, 'gc>, lbox: &LayoutBox<'gc>) {
         let origin = lbox.bounds().origin();
+
+        let edit_text = self.0.read();
+
+        // If text's top is under the textbox's bottom, skip drawing.
+        // TODO: FP actually skips drawing a line as soon as its bottom is under the textbox;
+        //   Current logic is conservative for safety (and even of this I'm not 100% sure).
+        // TODO: we should also cull text that's above the textbox
+        //   (instead of culling, this can be implemented as having the loop start from `scrollY`th line)
+        //   (maybe we could cull-before-render all glyphs, thus removing the need for masking?)
+        // TODO: also cull text that's simply out of screen, just like we cull whole DOs in render_self().
+        if origin.y() + Twips::from_pixels(Self::INTERNAL_PADDING)
+            - edit_text.vertical_scroll_offset()
+            > edit_text.bounds.y_max
+        {
+            return;
+        }
+
         context.transform_stack.push(&Transform {
             matrix: Matrix::translate(origin.x(), origin.y()),
             ..Default::default()
         });
 
-        let edit_text = self.0.read();
-
-        let visible_selection = if edit_text.flags.contains(EditTextFlag::HAS_FOCUS) {
+        let visible_selection = if self.has_focus() {
             edit_text.selection
         } else {
             None
@@ -931,9 +999,9 @@ impl<'gc> EditText<'gc> {
                     && !edit_text.flags.contains(EditTextFlag::READ_ONLY)
                     && visible_selection.start() >= *start
                     && visible_selection.end() <= *end
-                    && Utc::now().timestamp_subsec_millis() / 500 == 0
+                    && !visible_selection.blinks_now()
                 {
-                    Some((visible_selection.start() - start, end - start))
+                    Some(visible_selection.start() - start)
                 } else {
                     None
                 }
@@ -957,8 +1025,11 @@ impl<'gc> EditText<'gc> {
         if let Some((text, _tf, font, params, color)) =
             lbox.as_renderable_text(edit_text.text_spans.displayed_text())
         {
-            let baseline_adjustment =
-                font.get_baseline_for_height(params.height()) - params.height();
+            let baseline = font.get_baseline_for_height(params.height());
+            let descent = font.get_descent_for_height(params.height());
+            let baseline_adjustment = baseline - params.height();
+            let caret_height = baseline + descent;
+            let mut caret_x = Twips::ZERO;
             font.evaluate(
                 text,
                 self.text_transform(color, baseline_adjustment),
@@ -966,28 +1037,17 @@ impl<'gc> EditText<'gc> {
                 |pos, transform, glyph: &Glyph, advance, x| {
                     if let Some(glyph_shape_handle) = glyph.shape_handle(context.renderer) {
                         // If it's highlighted, override the color.
-                        match visible_selection {
-                            Some(visible_selection) if visible_selection.contains(start + pos) => {
-                                // Draw black selection rect
-                                let selection_box = context.transform_stack.transform().matrix
-                                    * Matrix::create_box(
-                                        advance.to_pixels() as f32,
-                                        params.height().to_pixels() as f32,
-                                        0.0,
-                                        x + Twips::from_pixels(-1.0),
-                                        Twips::from_pixels(2.0),
-                                    );
-                                context.commands.draw_rect(Color::BLACK, selection_box);
+                        if matches!(visible_selection, Some(visible_selection) if visible_selection.contains(start + pos)) {
+                            // Draw black selection rect
+                            self.render_selection(context, x, advance, caret_height);
 
-                                // Set text color to white
-                                context.transform_stack.push(&Transform {
-                                    matrix: transform.matrix,
-                                    color_transform: ColorTransform::IDENTITY,
-                                });
-                            }
-                            _ => {
-                                context.transform_stack.push(transform);
-                            }
+                            // Set text color to white
+                            context.transform_stack.push(&Transform {
+                                matrix: transform.matrix,
+                                color_transform: ColorTransform::IDENTITY,
+                            });
+                        } else {
+                            context.transform_stack.push(transform);
                         }
 
                         // Render glyph.
@@ -997,31 +1057,21 @@ impl<'gc> EditText<'gc> {
                         context.transform_stack.pop();
                     }
 
-                    if let Some((caret_pos, length)) = caret {
-                        if caret_pos == pos {
-                            let caret = context.transform_stack.transform().matrix
-                                * Matrix::create_box(
-                                    1.0,
-                                    params.height().to_pixels() as f32,
-                                    0.0,
-                                    x + Twips::from_pixels(-1.0),
-                                    Twips::from_pixels(2.0),
-                                );
-                            context.commands.draw_rect(color, caret);
-                        } else if pos == length - 1 && caret_pos == length {
-                            let caret = context.transform_stack.transform().matrix
-                                * Matrix::create_box(
-                                    1.0,
-                                    params.height().to_pixels() as f32,
-                                    0.0,
-                                    x + advance,
-                                    Twips::from_pixels(2.0),
-                                );
-                            context.commands.draw_rect(color, caret);
+                    // Update caret position
+                    if let Some(caret) = caret {
+                        if pos == caret {
+                            caret_x = x;
+                        } else if caret > 0 && pos == caret - 1 {
+                            // The caret may be rendered at the end, after all glyphs.
+                            caret_x = x + advance;
                         }
                     }
                 },
             );
+
+            if caret.is_some() {
+                self.render_caret(context, caret_x, caret_height, color);
+            }
         }
 
         if let Some(drawing) = lbox.as_renderable_drawing() {
@@ -1029,6 +1079,43 @@ impl<'gc> EditText<'gc> {
         }
 
         context.transform_stack.pop();
+    }
+
+    fn render_selection(
+        self,
+        context: &mut RenderContext<'_, 'gc>,
+        x: Twips,
+        width: Twips,
+        height: Twips,
+    ) {
+        let selection_box = context.transform_stack.transform().matrix
+            * Matrix::create_box(
+                width.to_pixels() as f32,
+                height.to_pixels() as f32,
+                0.0,
+                x,
+                Twips::ZERO,
+            );
+        context.commands.draw_rect(Color::BLACK, selection_box);
+    }
+
+    fn render_caret(
+        self,
+        context: &mut RenderContext<'_, 'gc>,
+        x: Twips,
+        height: Twips,
+        color: Color,
+    ) {
+        let cursor_width = Twips::from_pixels(1.0);
+        let caret = context.transform_stack.transform().matrix
+            * Matrix::create_box(
+                cursor_width.to_pixels() as f32,
+                height.to_pixels() as f32,
+                0.0,
+                x - cursor_width,
+                Twips::ZERO,
+            );
+        context.commands.draw_rect(color, caret);
     }
 
     /// Attempts to bind this text field to a property of a display object.
@@ -1061,7 +1148,7 @@ impl<'gc> EditText<'gc> {
             activation.run_with_child_frame_for_display_object(
                 "[Text Field Binding]",
                 parent,
-                activation.context.swf.version(),
+                self.movie().version(),
                 |activation| {
                     if let Ok(Some((object, property))) =
                         activation.resolve_variable_path(parent, &variable_path)
@@ -1145,7 +1232,7 @@ impl<'gc> EditText<'gc> {
                     activation.run_with_child_frame_for_display_object(
                         "[Propagate Text Binding]",
                         self.avm1_parent().unwrap(),
-                        activation.context.swf.version(),
+                        self.movie().version(),
                         |activation| {
                             let property = AvmString::new(activation.context.gc_context, property);
                             let _ = object.set(
@@ -1169,11 +1256,23 @@ impl<'gc> EditText<'gc> {
 
     pub fn set_selection(self, selection: Option<TextSelection>, gc_context: &Mutation<'gc>) {
         let mut text = self.0.write(gc_context);
+        let old_selection = text.selection;
         if let Some(mut selection) = selection {
             selection.clamp(text.text_spans.text().len());
             text.selection = Some(selection);
         } else {
             text.selection = None;
+        }
+
+        if old_selection != text.selection {
+            drop(text);
+            self.invalidate_cached_bitmap(gc_context);
+        }
+    }
+
+    pub fn reset_selection_blinking(self, gc_context: &Mutation<'gc>) {
+        if let Some(selection) = self.0.write(gc_context).selection.as_mut() {
+            selection.reset_blinking();
         }
     }
 
@@ -1211,7 +1310,8 @@ impl<'gc> EditText<'gc> {
             scroll as usize
         };
         let clamped = scroll_lines.clamp(1, self.maxscroll());
-        self.0.write(context.gc_context).scroll = clamped;
+        self.0.write(context.gc()).scroll = clamped;
+        self.invalidate_cached_bitmap(context.gc());
     }
 
     pub fn max_chars(self) -> i32 {
@@ -1224,17 +1324,49 @@ impl<'gc> EditText<'gc> {
 
     pub fn screen_position_to_index(self, position: Point<Twips>) -> Option<usize> {
         let text = self.0.read();
-        let Some(mut position) = self.global_to_local(position) else {
-            return None;
-        };
+        let mut position = self.global_to_local(position)?;
         position.x += Twips::from_pixels(Self::INTERNAL_PADDING) + Twips::from_pixels(text.hscroll);
         position.y += Twips::from_pixels(Self::INTERNAL_PADDING) + text.vertical_scroll_offset();
 
-        for layout_box in text.layout.iter().filter(|layout| {
-            layout
-                .bounds()
-                .contains(Position::from((position.x, position.y)))
-        }) {
+        // First determine which *row* of text is the closest match to the Y position...
+        let mut closest_row_extent_y = None;
+        for layout_box in text.layout.iter() {
+            if layout_box.is_text_box() {
+                if let Some(closest_extent_y) = closest_row_extent_y {
+                    if layout_box.bounds().extent_y() > closest_extent_y
+                        && position.y >= layout_box.bounds().offset_y()
+                    {
+                        closest_row_extent_y = Some(layout_box.bounds().extent_y());
+                    }
+                } else {
+                    closest_row_extent_y = Some(layout_box.bounds().extent_y());
+                }
+            }
+        }
+
+        // ...then find the box within that row that is the closest match to the X position.
+        let mut closest_layout_box: Option<&LayoutBox<'gc>> = None;
+        if let Some(closest_extent_y) = closest_row_extent_y {
+            for layout_box in text.layout.iter() {
+                if layout_box.is_text_box() {
+                    match layout_box.bounds().extent_y().cmp(&closest_extent_y) {
+                        Ordering::Less => {}
+                        Ordering::Equal => {
+                            if position.x >= layout_box.bounds().offset_x()
+                                || closest_layout_box.is_none()
+                            {
+                                closest_layout_box = Some(layout_box);
+                            } else {
+                                break;
+                            }
+                        }
+                        Ordering::Greater => break,
+                    }
+                }
+            }
+        }
+
+        if let Some(layout_box) = closest_layout_box {
             let origin = layout_box.bounds().origin();
             let mut matrix = Matrix::translate(origin.x(), origin.y());
             matrix = matrix.inverse().expect("Invertible layout matrix");
@@ -1243,7 +1375,7 @@ impl<'gc> EditText<'gc> {
             if let Some((text, _tf, font, params, color)) =
                 layout_box.as_renderable_text(text.text_spans.text())
             {
-                let mut result = None;
+                let mut result = 0;
                 let baseline_adjustment =
                     font.get_baseline_for_height(params.height()) - params.height();
                 font.evaluate(
@@ -1251,31 +1383,22 @@ impl<'gc> EditText<'gc> {
                     self.text_transform(color, baseline_adjustment),
                     params,
                     |pos, _transform, _glyph: &Glyph, advance, x| {
-                        if local_position.x >= x
-                            && local_position.x <= x + advance
-                            && local_position.y >= Twips::ZERO
-                            && local_position.y <= params.height()
-                        {
-                            if local_position.x >= x + (advance / 2) {
-                                result = Some(string_utils::next_char_boundary(text, pos));
+                        if local_position.x >= x {
+                            if local_position.x > x + (advance / 2) {
+                                result = string_utils::next_char_boundary(text, pos);
                             } else {
-                                result = Some(pos);
+                                result = pos;
                             }
                         }
                     },
                 );
-                if let Some(index_in_layout) = result {
-                    return Some(
-                        if let LayoutContent::Text { start, .. } = layout_box.content() {
-                            index_in_layout + start
-                        } else {
-                            index_in_layout // [NA] Not sure if it's possible to get here?
-                        },
-                    );
+                if let LayoutContent::Text { start, .. } = layout_box.content() {
+                    return Some(result + start);
                 }
             }
         }
 
+        // Should only be reached if there are no text layout boxes at all.
         None
     }
 
@@ -1310,9 +1433,15 @@ impl<'gc> EditText<'gc> {
             let mut changed = false;
             let is_selectable = self.is_selectable();
             match control_code {
-                TextControlCode::MoveLeft => {
-                    let new_pos = if selection.is_caret() && selection.to > 0 {
-                        string_utils::prev_char_boundary(&self.text(), selection.to)
+                TextControlCode::Enter => {
+                    self.text_input(Self::INPUT_NEWLINE, context);
+                }
+                TextControlCode::MoveLeft
+                | TextControlCode::MoveLeftWord
+                | TextControlCode::MoveLeftLine
+                | TextControlCode::MoveLeftDocument => {
+                    let new_pos = if selection.is_caret() {
+                        self.find_new_position(control_code, selection.to)
                     } else {
                         selection.start()
                     };
@@ -1321,9 +1450,12 @@ impl<'gc> EditText<'gc> {
                         context.gc_context,
                     );
                 }
-                TextControlCode::MoveRight => {
+                TextControlCode::MoveRight
+                | TextControlCode::MoveRightWord
+                | TextControlCode::MoveRightLine
+                | TextControlCode::MoveRightDocument => {
                     let new_pos = if selection.is_caret() && selection.to < self.text().len() {
-                        string_utils::next_char_boundary(&self.text(), selection.to)
+                        self.find_new_position(control_code, selection.to)
                     } else {
                         selection.end()
                     };
@@ -1332,18 +1464,24 @@ impl<'gc> EditText<'gc> {
                         context.gc_context,
                     );
                 }
-                TextControlCode::SelectLeft => {
+                TextControlCode::SelectLeft
+                | TextControlCode::SelectLeftWord
+                | TextControlCode::SelectLeftLine
+                | TextControlCode::SelectLeftDocument => {
                     if is_selectable && selection.to > 0 {
-                        let new_pos = string_utils::prev_char_boundary(&self.text(), selection.to);
+                        let new_pos = self.find_new_position(control_code, selection.to);
                         self.set_selection(
                             Some(TextSelection::for_range(selection.from, new_pos)),
                             context.gc_context,
                         );
                     }
                 }
-                TextControlCode::SelectRight => {
+                TextControlCode::SelectRight
+                | TextControlCode::SelectRightWord
+                | TextControlCode::SelectRightLine
+                | TextControlCode::SelectRightDocument => {
                     if is_selectable && selection.to < self.text().len() {
-                        let new_pos = string_utils::next_char_boundary(&self.text(), selection.to);
+                        let new_pos = self.find_new_position(control_code, selection.to);
                         self.set_selection(
                             Some(TextSelection::for_range(selection.from, new_pos)),
                             context.gc_context,
@@ -1365,14 +1503,18 @@ impl<'gc> EditText<'gc> {
                     }
                 }
                 TextControlCode::Paste => {
-                    let text = &context.ui.clipboard_content();
-                    // TODO: To match Flash Player, we should truncate pasted text that is longer than max_chars
-                    // instead of canceling the paste action entirely
+                    let text = context.ui.clipboard_content();
+                    let mut text = self.0.read().restrict.filter_allowed(&text);
+
+                    if text.len() > self.available_chars() && self.available_chars() > 0 {
+                        text = text[0..self.available_chars()].to_owned();
+                    }
+
                     if text.len() <= self.available_chars() {
                         self.replace_text(
                             selection.start(),
                             selection.end(),
-                            &WString::from_utf8(text),
+                            &WString::from_utf8(&text),
                             context,
                         );
                         let new_pos = selection.start() + text.len();
@@ -1415,7 +1557,12 @@ impl<'gc> EditText<'gc> {
                         changed = true;
                     }
                 }
-                TextControlCode::Backspace | TextControlCode::Delete if !selection.is_caret() => {
+                TextControlCode::Backspace
+                | TextControlCode::BackspaceWord
+                | TextControlCode::Delete
+                | TextControlCode::DeleteWord
+                    if !selection.is_caret() =>
+                {
                     // Backspace or delete with multiple characters selected
                     self.replace_text(selection.start(), selection.end(), WStr::empty(), context);
                     self.set_selection(
@@ -1424,12 +1571,11 @@ impl<'gc> EditText<'gc> {
                     );
                     changed = true;
                 }
-                TextControlCode::Backspace => {
+                TextControlCode::Backspace | TextControlCode::BackspaceWord => {
                     // Backspace with caret
                     if selection.start() > 0 {
-                        // Delete previous character
-                        let text = self.text();
-                        let start = string_utils::prev_char_boundary(&text, selection.start());
+                        // Delete previous character(s)
+                        let start = self.find_new_position(control_code, selection.start());
                         self.replace_text(start, selection.start(), WStr::empty(), context);
                         self.set_selection(
                             Some(TextSelection::for_position(start)),
@@ -1438,18 +1584,17 @@ impl<'gc> EditText<'gc> {
                         changed = true;
                     }
                 }
-                TextControlCode::Delete => {
+                TextControlCode::Delete | TextControlCode::DeleteWord => {
                     // Delete with caret
                     if selection.end() < self.text_length() {
-                        // Delete next character
-                        let text = self.text();
-                        let end = string_utils::next_char_boundary(&text, selection.start());
+                        // Delete next character(s)
+                        let end = self.find_new_position(control_code, selection.start());
                         self.replace_text(selection.start(), end, WStr::empty(), context);
-                        // No need to change selection
+                        // No need to change selection, reset it to prevent caret from blinking
+                        self.reset_selection_blinking(context.gc_context);
                         changed = true;
                     }
                 }
-                _ => {}
             }
             if changed {
                 let mut activation = Avm1Activation::from_nothing(
@@ -1463,63 +1608,163 @@ impl<'gc> EditText<'gc> {
         }
     }
 
+    /// Find the new position in the text for the given control code.
+    ///
+    /// * For selection codes it will represent the "to" part of the selection.
+    /// * For left/right moves it will represent the final caret position.
+    /// * For backspace/delete it will represent the position to which the text should be deleted.
+    fn find_new_position(self, control_code: TextControlCode, current_pos: usize) -> usize {
+        match control_code {
+            TextControlCode::SelectRight | TextControlCode::MoveRight | TextControlCode::Delete => {
+                string_utils::next_char_boundary(&self.text(), current_pos)
+            }
+            TextControlCode::SelectLeft
+            | TextControlCode::MoveLeft
+            | TextControlCode::Backspace => {
+                string_utils::prev_char_boundary(&self.text(), current_pos)
+            }
+            TextControlCode::SelectRightWord
+            | TextControlCode::MoveRightWord
+            | TextControlCode::DeleteWord => self.find_next_word_boundary(current_pos),
+            TextControlCode::SelectLeftWord
+            | TextControlCode::MoveLeftWord
+            | TextControlCode::BackspaceWord => self.find_prev_word_boundary(current_pos),
+            TextControlCode::SelectRightLine | TextControlCode::MoveRightLine => {
+                self.find_next_line_boundary(current_pos)
+            }
+            TextControlCode::SelectLeftLine | TextControlCode::MoveLeftLine => {
+                self.find_prev_line_boundary(current_pos)
+            }
+            TextControlCode::SelectRightDocument | TextControlCode::MoveRightDocument => {
+                self.text().len()
+            }
+            TextControlCode::SelectLeftDocument | TextControlCode::MoveLeftDocument => 0,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Find the nearest word boundary before `pos`,
+    /// which is applicable for selection.
+    ///
+    /// This algorithm is based on [UAX #29](https://unicode.org/reports/tr29/).
+    fn find_prev_word_boundary(self, pos: usize) -> usize {
+        let head = &self.text()[..pos];
+        let to_utf8 = WStrToUtf8::new(head);
+        WordBoundIndices::new(&to_utf8.to_utf8_lossy())
+            .rev()
+            .find(|(_, span)| !span.trim().is_empty())
+            .map(|(position, _)| position)
+            .and_then(|utf8_index| to_utf8.utf16_index(utf8_index))
+            .unwrap_or(0)
+    }
+
+    /// Find the nearest word boundary after `pos`,
+    /// which is applicable for selection.
+    ///
+    /// This algorithm is based on [UAX #29](https://unicode.org/reports/tr29/).
+    fn find_next_word_boundary(self, pos: usize) -> usize {
+        let tail = &self.text()[pos..];
+        let to_utf8 = WStrToUtf8::new(tail);
+        WordBoundIndices::new(&to_utf8.to_utf8_lossy())
+            .skip_while(|(_, span)| span.trim().is_empty())
+            .nth(1)
+            .map(|p| p.0)
+            .and_then(|utf8_index| to_utf8.utf16_index(utf8_index))
+            .map(|utf16_index| pos + utf16_index)
+            .unwrap_or_else(|| self.text().len())
+    }
+
+    /// Find the nearest line boundary before or at `pos`.
+    fn find_prev_line_boundary(self, pos: usize) -> usize {
+        // TODO take into account the text layout instead of relying on newlines only
+        if pos == 0 {
+            return 0;
+        }
+
+        let mut line_break_pos = pos;
+        while line_break_pos > 0 && !self.is_newline_at(line_break_pos - 1) {
+            line_break_pos -= 1;
+        }
+
+        line_break_pos
+    }
+
+    /// Find the nearest line boundary after or at `pos`.
+    fn find_next_line_boundary(self, pos: usize) -> usize {
+        // TODO take into account the text layout instead of relying on newlines only
+        let len = self.text().len();
+        if pos >= len {
+            return len;
+        }
+
+        let mut line_break_pos = pos;
+        while line_break_pos < len && !self.is_newline_at(line_break_pos) {
+            line_break_pos += 1;
+        }
+        line_break_pos
+    }
+
+    fn is_newline_at(self, pos: usize) -> bool {
+        self.text().get(pos).unwrap_or(0) == '\n' as u16
+    }
+
     pub fn text_input(self, character: char, context: &mut UpdateContext<'_, 'gc>) {
-        if self.0.read().flags.contains(EditTextFlag::READ_ONLY) {
+        if self.0.read().flags.contains(EditTextFlag::READ_ONLY)
+            || (character.is_control() && character != Self::INPUT_NEWLINE)
+            || self.available_chars() == 0
+        {
             return;
         }
 
-        if let Some(selection) = self.selection() {
-            let mut changed = false;
-            let mut cancelled = false;
-            match character as u8 {
-                code if !(code as char).is_control() => {
-                    if self.available_chars() > 0 {
-                        if let Avm2Value::Object(target) = self.object2() {
-                            let character_string =
-                                AvmString::new_utf8(context.gc_context, character.to_string());
+        if !self.is_multiline() && character == Self::INPUT_NEWLINE {
+            return;
+        }
 
-                            let mut activation = Avm2Activation::from_nothing(context.reborrow());
-                            let text_evt = Avm2EventObject::text_event(
-                                &mut activation,
-                                "textInput",
-                                character_string,
-                                true,
-                                true,
-                            );
-                            Avm2::dispatch_event(&mut activation.context, text_evt, target);
+        let Some(selection) = self.selection() else {
+            return;
+        };
 
-                            cancelled = text_evt.as_event().unwrap().is_cancelled();
-                        }
+        let Some(character) = self.0.read().restrict.to_allowed(character) else {
+            return;
+        };
 
-                        if !cancelled {
-                            self.replace_text(
-                                selection.start(),
-                                selection.end(),
-                                &WString::from_char(character),
-                                context,
-                            );
-                            let new_pos = selection.start() + character.len_utf8();
-                            self.set_selection(
-                                Some(TextSelection::for_position(new_pos)),
-                                context.gc_context,
-                            );
-                            changed = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
+        if let Avm2Value::Object(target) = self.object2() {
+            let character_string = AvmString::new_utf8(context.gc_context, character.to_string());
 
-            if changed {
-                let mut activation = Avm1Activation::from_nothing(
-                    context.reborrow(),
-                    ActivationIdentifier::root("[Propagate Text Binding]"),
-                    self.into(),
-                );
-                self.propagate_text_binding(&mut activation);
-                self.on_changed(&mut activation);
+            let mut activation = Avm2Activation::from_nothing(context.reborrow());
+            let text_evt = Avm2EventObject::text_event(
+                &mut activation,
+                "textInput",
+                character_string,
+                true,
+                true,
+            );
+            Avm2::dispatch_event(&mut activation.context, text_evt, target);
+
+            if text_evt.as_event().unwrap().is_cancelled() {
+                return;
             }
         }
+
+        self.replace_text(
+            selection.start(),
+            selection.end(),
+            &WString::from_char(character),
+            context,
+        );
+        let new_pos = selection.start() + character.len_utf8();
+        self.set_selection(
+            Some(TextSelection::for_position(new_pos)),
+            context.gc_context,
+        );
+
+        let mut activation = Avm1Activation::from_nothing(
+            context.reborrow(),
+            ActivationIdentifier::root("[Propagate Text Binding]"),
+            self.into(),
+        );
+        self.propagate_text_binding(&mut activation);
+        self.on_changed(&mut activation);
     }
 
     fn initialize_as_broadcaster(&self, activation: &mut Avm1Activation<'_, 'gc>) {
@@ -1560,6 +1805,18 @@ impl<'gc> EditText<'gc> {
             );
             Avm2::dispatch_event(&mut activation.context, change_evt, object);
         }
+    }
+
+    fn on_scroller(&self, activation: &mut Avm1Activation<'_, 'gc>) {
+        if let Avm1Value::Object(object) = self.object() {
+            let _ = object.call_method(
+                "broadcastMessage".into(),
+                &["onScroller".into(), object.into()],
+                activation,
+                ExecutionReason::Special,
+            );
+        }
+        //TODO: Implement this for Avm2
     }
 
     /// Construct the text field's AVM1 representation.
@@ -1690,6 +1947,28 @@ impl<'gc> EditText<'gc> {
         })
     }
 
+    pub fn line_text(self, line: usize) -> Option<WString> {
+        let read = self.0.read();
+        let line = read.line_data.get(line).copied()?;
+
+        let mut text = WString::new();
+        for layout_box in read.layout.iter() {
+            if layout_box.bounds().offset_y() < line.offset
+                || layout_box.bounds().extent_y() > line.extent
+            {
+                continue;
+            }
+
+            if let LayoutContent::Text { start, end, .. } = layout_box.content() {
+                if let Some(box_tex) = read.text_spans.text().slice(*start..*end) {
+                    text.push_str(box_tex);
+                }
+            }
+        }
+
+        Some(text)
+    }
+
     fn execute_avm1_asfunction(
         self,
         context: &mut UpdateContext<'_, 'gc>,
@@ -1785,7 +2064,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(&self, context: &mut UpdateContext<'_, 'gc>) {
-        if context.is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
+        if self.movie().is_action_script_3() && matches!(self.object2(), Avm2Value::Null) {
             self.construct_as_avm2_object(context, (*self).into());
             self.on_construction_complete(context);
         }
@@ -1812,13 +2091,10 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
     ) {
         self.set_default_instance_name(context);
 
-        if !context.is_action_script_3() {
+        if !self.movie().is_action_script_3() {
             context
                 .avm1
                 .add_to_exec_list(context.gc_context, (*self).into());
-        }
-
-        if !self.movie().is_action_script_3() {
             self.construct_as_avm1_object(context, run_frame);
         }
     }
@@ -1843,21 +2119,6 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
 
     fn set_object2(&self, context: &mut UpdateContext<'_, 'gc>, to: Avm2Object<'gc>) {
         self.0.write(context.gc_context).object = Some(to.into());
-    }
-
-    fn set_parent(&self, context: &mut UpdateContext<'_, 'gc>, parent: Option<DisplayObject<'gc>>) {
-        let had_parent = self.parent().is_some();
-        self.base_mut(context.gc_context)
-            .set_parent_ignoring_orphan_list(parent);
-        let has_parent = self.parent().is_some();
-
-        if self.movie().is_action_script_3() && had_parent && !has_parent {
-            let had_focus = self.0.read().flags.contains(EditTextFlag::HAS_FOCUS);
-            if had_focus {
-                let tracker = context.focus_tracker;
-                tracker.set(None, context);
-            }
-        }
     }
 
     fn self_bounds(&self) -> Rectangle<Twips> {
@@ -1968,7 +2229,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
         });
 
         if edit_text.layout.is_empty() && !edit_text.flags.contains(EditTextFlag::READ_ONLY) {
-            let visible_selection = if edit_text.flags.contains(EditTextFlag::HAS_FOCUS) {
+            let visible_selection = if self.has_focus() {
                 edit_text.selection
             } else {
                 None
@@ -1976,21 +2237,11 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
             if let Some(visible_selection) = visible_selection {
                 if visible_selection.is_caret()
                     && visible_selection.start() == 0
-                    && Utc::now().timestamp_subsec_millis() / 500 == 0
+                    && !visible_selection.blinks_now()
                 {
-                    let caret = context.transform_stack.transform().matrix
-                        * Matrix::create_box(
-                            1.0,
-                            edit_text
-                                .text_spans
-                                .default_format()
-                                .size
-                                .unwrap_or_default() as f32,
-                            0.0,
-                            Twips::from_pixels(-1.0),
-                            Twips::from_pixels(2.0),
-                        );
-                    context.commands.draw_rect(Color::BLACK, caret);
+                    let format = edit_text.text_spans.default_format();
+                    let caret_height = format.size.map(Twips::from_pixels).unwrap_or_default();
+                    self.render_caret(context, Twips::ZERO, caret_height, Color::BLACK);
                 }
             }
         } else {
@@ -2016,11 +2267,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
     }
 
     fn avm1_unload(&self, context: &mut UpdateContext<'_, 'gc>) {
-        let had_focus = self.0.read().flags.contains(EditTextFlag::HAS_FOCUS);
-        if had_focus {
-            let tracker = context.focus_tracker;
-            tracker.set(None, context);
-        }
+        self.drop_focus(context);
 
         if let Some(node) = self.maskee() {
             node.set_masker(context.gc_context, None, true);
@@ -2047,20 +2294,6 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
 
         self.set_avm1_removed(context.gc_context, true);
     }
-
-    fn on_focus_changed(&self, gc_context: &Mutation<'gc>, focused: bool) {
-        let is_action_script_3 = self.movie().is_action_script_3();
-        let mut text = self.0.write(gc_context);
-        text.flags.set(EditTextFlag::HAS_FOCUS, focused);
-        if !focused && !is_action_script_3 {
-            text.selection = None;
-        }
-    }
-
-    fn is_focusable(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
-        // Even if this isn't selectable or editable, a script can focus on it manually.
-        true
-    }
 }
 
 impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
@@ -2081,55 +2314,88 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         _context: &mut UpdateContext<'_, 'gc>,
         event: ClipEvent,
     ) -> ClipEventResult {
-        if event != ClipEvent::Press {
-            return ClipEventResult::NotHandled;
+        match event {
+            ClipEvent::Press | ClipEvent::MouseWheel { .. } | ClipEvent::MouseMove => {
+                ClipEventResult::Handled
+            }
+            _ => ClipEventResult::NotHandled,
         }
-
-        ClipEventResult::Handled
     }
 
     fn event_dispatch(
         self,
         context: &mut UpdateContext<'_, 'gc>,
-        _event: ClipEvent<'gc>,
+        event: ClipEvent<'gc>,
     ) -> ClipEventResult {
-        if self.is_editable() || self.is_selectable() {
-            let tracker = context.focus_tracker;
-            tracker.set(Some(self.into()), context);
-        }
+        if let ClipEvent::MouseWheel { delta } = event {
+            if self.is_mouse_wheel_enabled() {
+                let new_scroll = self.scroll() as f64 - delta.lines();
+                self.set_scroll(new_scroll, context);
 
-        // We can't hold self as any link may end up modifying this object, so pull the info out
-        let mut link_to_open = None;
-
-        if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
-            self.0.write(context.gc_context).selection =
-                Some(TextSelection::for_position(position));
-
-            if let Some((span_index, _)) =
-                self.0.read().text_spans.resolve_position_as_span(position)
-            {
-                link_to_open = self
-                    .0
-                    .read()
-                    .text_spans
-                    .span(span_index)
-                    .map(|s| (s.url.clone(), s.target.clone()));
+                let mut activation = Avm1Activation::from_nothing(
+                    context.reborrow(),
+                    ActivationIdentifier::root("[On Scroller]"),
+                    self.into(),
+                );
+                self.on_scroller(&mut activation);
             }
-        } else {
-            self.0.write(context.gc_context).selection =
-                Some(TextSelection::for_position(self.text_length()));
+            return ClipEventResult::Handled;
         }
 
-        if let Some((url, target)) = link_to_open {
-            if !url.is_empty() {
-                // TODO: This fires on mouse DOWN but it should be mouse UP...
-                // but only if it went down in the same span.
-                // Needs more advanced focus handling than we have at time of writing this comment.
-                self.open_url(context, &url, &target);
+        if let ClipEvent::Press = event {
+            if self.is_editable() || self.is_selectable() {
+                let tracker = context.focus_tracker;
+                tracker.set(Some(self.into()), context);
+            }
+
+            // We can't hold self as any link may end up modifying this object, so pull the info out
+            let mut link_to_open = None;
+
+            if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
+                self.set_selection(Some(TextSelection::for_position(position)), context.gc());
+
+                if let Some((span_index, _)) =
+                    self.0.read().text_spans.resolve_position_as_span(position)
+                {
+                    link_to_open = self
+                        .0
+                        .read()
+                        .text_spans
+                        .span(span_index)
+                        .map(|s| (s.url.clone(), s.target.clone()));
+                }
+            } else {
+                self.set_selection(
+                    Some(TextSelection::for_position(self.text_length())),
+                    context.gc(),
+                );
+            }
+
+            if let Some((url, target)) = link_to_open {
+                if !url.is_empty() {
+                    // TODO: This fires on mouse DOWN but it should be mouse UP...
+                    // but only if it went down in the same span.
+                    // Needs more advanced focus handling than we have at time of writing this comment.
+                    self.open_url(context, &url, &target);
+                }
+            }
+
+            return ClipEventResult::Handled;
+        }
+
+        if let ClipEvent::MouseMove = event {
+            // If a mouse has moved and this EditTest is pressed, we need to update the selection.
+            if InteractiveObject::option_ptr_eq(context.mouse_data.pressed, self.as_interactive()) {
+                if let Some(mut selection) = self.selection() {
+                    if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
+                        selection.to = position;
+                        self.set_selection(Some(selection), context.gc());
+                    }
+                }
             }
         }
 
-        ClipEventResult::Handled
+        ClipEventResult::NotHandled
     }
 
     fn mouse_pick_avm1(
@@ -2138,6 +2404,11 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
+        // Don't do anything if run in an AVM2 context.
+        if self.as_displayobject().movie().is_action_script_3() {
+            return None;
+        }
+
         // The text is hovered if the mouse is over any child nodes.
         if self.visible()
             && self.mouse_enabled()
@@ -2156,6 +2427,11 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        // Don't do anything if run in an AVM1 context.
+        if !self.as_displayobject().movie().is_action_script_3() {
+            return Avm2MousePick::Miss;
+        }
+
         // The text is hovered if the mouse is over any child nodes.
         if self.visible() && self.hit_test_shape(context, point, HitTestOptions::MOUSE_PICK) {
             // Note - for mouse-enabled selectable text, we consider this to be a hit (which
@@ -2183,6 +2459,35 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
             MouseCursor::Arrow
         }
     }
+
+    fn on_focus_changed(
+        &self,
+        context: &mut UpdateContext<'_, 'gc>,
+        focused: bool,
+        _other: Option<InteractiveObject<'gc>>,
+    ) {
+        let is_avm1 = !self.movie().is_action_script_3();
+        if !focused && is_avm1 {
+            self.set_selection(None, context.gc_context);
+        }
+    }
+
+    fn is_highlightable(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
+        // TextField is incapable of rendering a highlight.
+        false
+    }
+
+    fn is_tabbable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if !self.is_editable() {
+            // Non-editable text fields are never tabbable.
+            return false;
+        }
+        self.tab_enabled(context)
+    }
+
+    fn tab_enabled_default(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
+        self.is_editable()
+    }
 }
 
 bitflags::bitflags! {
@@ -2190,7 +2495,6 @@ bitflags::bitflags! {
     struct EditTextFlag: u16 {
         const FIRING_VARIABLE_BINDING = 1 << 0;
         const HAS_BACKGROUND = 1 << 1;
-        const HAS_FOCUS = 1 << 2;
 
         // The following bits need to match `swf::EditTextFlag`.
         const READ_ONLY = 1 << 3;
@@ -2221,7 +2525,18 @@ struct EditTextStatic {
 pub struct TextSelection {
     from: usize,
     to: usize,
+
+    /// The time the caret should begin blinking
+    blink_epoch: DateTime<Utc>,
 }
+
+impl PartialEq for TextSelection {
+    fn eq(&self, other: &Self) -> bool {
+        self.from == other.from && self.to == other.to
+    }
+}
+
+impl Eq for TextSelection {}
 
 /// Information about the start and end y-coordinates of a given line of text
 #[derive(Copy, Clone, Debug)]
@@ -2234,15 +2549,22 @@ pub struct LineData {
 }
 
 impl TextSelection {
+    const BLINK_CYCLE_DURATION_MS: u32 = 1000;
+
     pub fn for_position(position: usize) -> Self {
         Self {
             from: position,
             to: position,
+            blink_epoch: Utc::now(),
         }
     }
 
     pub fn for_range(from: usize, to: usize) -> Self {
-        Self { from, to }
+        Self {
+            from,
+            to,
+            blink_epoch: Utc::now(),
+        }
     }
 
     /// The "from" part of the range is where the user started the selection.
@@ -2293,5 +2615,222 @@ impl TextSelection {
     /// If this is false, text is replaced at the positions.
     pub fn is_caret(&self) -> bool {
         self.to == self.from
+    }
+
+    pub fn reset_blinking(&mut self) {
+        self.blink_epoch = Utc::now();
+    }
+
+    /// Returns true if the caret should not be visible now due to blinking.
+    pub fn blinks_now(&self) -> bool {
+        let millis = (Utc::now() - self.blink_epoch).num_milliseconds() as u32;
+        2 * (millis % Self::BLINK_CYCLE_DURATION_MS) >= Self::BLINK_CYCLE_DURATION_MS
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EditTextRestrict {
+    /// Original string value.
+    value: Option<WString>,
+
+    /// List of intervals (inclusive, inclusive) with allowed characters.
+    allowed: Vec<(char, char)>,
+
+    /// List of intervals (inclusive, inclusive) with disallowed characters.
+    disallowed: Vec<(char, char)>,
+}
+
+enum EditTextRestrictToken {
+    Char(char),
+    Range,
+    Caret,
+}
+
+impl EditTextRestrict {
+    const INTERVAL_ALL: (char, char) = ('\0', char::MAX);
+
+    pub fn allow_all() -> Self {
+        Self {
+            value: None,
+            allowed: vec![Self::INTERVAL_ALL],
+            disallowed: vec![],
+        }
+    }
+
+    pub fn allow_none() -> Self {
+        Self {
+            value: Some(WString::new()),
+            allowed: vec![],
+            disallowed: vec![],
+        }
+    }
+
+    pub fn from(value: Option<&WStr>) -> Self {
+        match value {
+            None => Self::allow_all(),
+            Some(string) => Self::from_string(string),
+        }
+    }
+
+    pub fn from_string(string: &WStr) -> Self {
+        if string.is_empty() {
+            return Self::allow_none();
+        }
+
+        let mut tokens = Self::tokenize_restrict(string);
+        let mut allowed: Vec<(char, char)> = vec![];
+        let mut disallowed: Vec<(char, char)> = vec![];
+
+        Self::parse_restrict(&mut tokens, &mut allowed, &mut disallowed);
+
+        Self {
+            value: Some(string.into()),
+            allowed,
+            disallowed,
+        }
+    }
+
+    fn tokenize_restrict(string: &WStr) -> VecDeque<EditTextRestrictToken> {
+        let mut characters: VecDeque<char> = string
+            .chars()
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<VecDeque<char>>();
+        let mut tokens: VecDeque<EditTextRestrictToken> = VecDeque::with_capacity(characters.len());
+
+        while !characters.is_empty() {
+            match characters.pop_front().unwrap() {
+                // Handle escapes: \\, \-, \^.
+                // In fact, other escapes also work, so that \a is equivalent to a, not to \\a.
+                '\\' => {
+                    if let Some(escaped) = characters.pop_front() {
+                        tokens.push_back(EditTextRestrictToken::Char(escaped));
+                    } else {
+                        // Ignore truncated escapes (when the string ends with \).
+                    }
+                }
+                '^' => {
+                    tokens.push_back(EditTextRestrictToken::Caret);
+                }
+                '-' => {
+                    tokens.push_back(EditTextRestrictToken::Range);
+                }
+                c => {
+                    tokens.push_back(EditTextRestrictToken::Char(c));
+                }
+            }
+        }
+
+        tokens
+    }
+
+    fn parse_restrict(
+        tokens: &mut VecDeque<EditTextRestrictToken>,
+        allowed: &mut Vec<(char, char)>,
+        disallowed: &mut Vec<(char, char)>,
+    ) {
+        let mut current_intervals: Vec<(char, char)> = vec![];
+        let mut last_char: Option<char> = None;
+        let mut now_allowing = true;
+        while !tokens.is_empty() {
+            last_char = match tokens.pop_front().unwrap() {
+                EditTextRestrictToken::Char(c) => {
+                    current_intervals.push((c, c));
+                    Some(c)
+                }
+                EditTextRestrictToken::Caret => {
+                    if now_allowing {
+                        if current_intervals.is_empty() && allowed.is_empty() {
+                            // If restrict starts with ^, we are assuming that
+                            // all characters are allowed and disallowing from that.
+                            allowed.append(&mut vec![Self::INTERVAL_ALL]);
+                        } else {
+                            allowed.append(&mut current_intervals);
+                        }
+                    } else {
+                        disallowed.append(&mut current_intervals);
+                    }
+
+                    // Caret according to the documentation indicates
+                    // that we are now disallowing characters.
+                    // In reality it just switches allowing/disallowing.
+                    now_allowing = !now_allowing;
+                    None
+                }
+                EditTextRestrictToken::Range => {
+                    let range_start = if let Some(last_char) = last_char {
+                        current_intervals.pop();
+                        last_char
+                    } else {
+                        // When the range is truncated from the left side (-z),
+                        // it is equivalent to \0-z.
+                        '\0'
+                    };
+                    let range_end;
+                    if let Some(EditTextRestrictToken::Char(c)) = tokens.front() {
+                        range_end = *c;
+                        tokens.pop_front();
+                    } else {
+                        // When the range is truncated from the right side (a-),
+                        // it is equivalent to the first character (a).
+                        range_end = range_start;
+                    }
+                    // If the range a-z is inverted (z-a), it is equivalent to
+                    // the first character only (z).
+                    current_intervals.push((range_start, range_end.max(range_start)));
+                    None
+                }
+            }
+        }
+
+        if now_allowing {
+            allowed.append(&mut current_intervals);
+        } else {
+            disallowed.append(&mut current_intervals);
+        }
+    }
+
+    pub fn value(&self) -> Option<&WStr> {
+        self.value.as_deref()
+    }
+
+    pub fn is_allowed(&self, character: char) -> bool {
+        self.intervals_contain(character, &self.allowed)
+            && !self.intervals_contain(character, &self.disallowed)
+    }
+
+    fn intervals_contain(&self, character: char, intervals: &Vec<(char, char)>) -> bool {
+        for interval in intervals {
+            if self.interval_contains(character, interval) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn interval_contains(&self, character: char, interval: &(char, char)) -> bool {
+        character >= interval.0 && character <= interval.1
+    }
+
+    pub fn to_allowed(&self, character: char) -> Option<char> {
+        if self.is_allowed(character) {
+            Some(character)
+        } else if self.is_allowed(character.to_ascii_uppercase()) {
+            Some(character.to_ascii_uppercase())
+        } else if self.is_allowed(character.to_ascii_lowercase()) {
+            Some(character.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    pub fn filter_allowed(&self, text: &str) -> String {
+        let mut filtered = String::with_capacity(text.len());
+        for c in text.chars() {
+            if let Some(c) = self.to_allowed(c) {
+                filtered.push(c);
+            }
+        }
+        filtered
     }
 }

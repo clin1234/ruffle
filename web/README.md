@@ -57,7 +57,7 @@ should work. Additionally, headless JREs should also work.
 
 Follow the instructions to [install Node.js](https://nodejs.org/) on your machine.
 
-We recommend using the currently active LTS 18, but we do also run tests with current Node.js 20.
+We recommend using the currently active LTS 20, but we do also run tests with current Node.js 22.
 
 Note that npm 7 or newer is required. It should come bundled with Node.js 15 or newer, but can be upgraded with older Node.js versions using `npm install -g npm` as root/Administrator.
 
@@ -65,7 +65,7 @@ Note that npm 7 or newer is required. It should come bundled with Node.js 15 or 
 
 <!-- Be sure to also update the wasm-bindgen-cli version in `.github/workflows/*.yml` and `web/Cargo.toml`. -->
 
-This can be installed with `cargo install wasm-bindgen-cli --version 0.2.89`. Be sure to install this specific version of `wasm-bindgen-cli` to match the version used by Ruffle.
+This can be installed with `cargo install wasm-bindgen-cli --version 0.2.92`. Be sure to install this specific version of `wasm-bindgen-cli` to match the version used by Ruffle.
 
 #### Binaryen
 
@@ -79,6 +79,18 @@ Some ways to install Binaryen:
 -   [compile it yourself](https://github.com/WebAssembly/binaryen#building)
 
 Just make sure the `wasm-opt` program is in `$PATH`, and that it works.
+
+#### Optional features
+
+##### `jpegxr`
+
+The release version of the extension is compiled with `jpegxr`.
+To enable it, set the the env `CARGO_FEATURES="jpegxr"`.
+
+Windows dependencies:
+
+- Install LLVM and add the full path of its `bin` folder (example: `C:\Program Files\LLVM-18.1.6\bin`) to your env `PATH`.
+- Set env `LIBCLANG_PATH` with the same `bin` folder.
 
 ### Building
 

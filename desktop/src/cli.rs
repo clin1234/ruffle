@@ -1,15 +1,31 @@
+use crate::preferences::storage::StorageBackend;
 use crate::RUFFLE_VERSION;
-use anyhow::Error;
-use clap::Parser;
+use anyhow::{anyhow, Error};
+use clap::{Parser, ValueEnum};
 use ruffle_core::backend::navigator::{OpenURLMode, SocketMode};
 use ruffle_core::config::Letterbox;
+use ruffle_core::events::{GamepadButton, KeyCode};
 use ruffle_core::{LoadBehavior, PlayerRuntime, StageAlign, StageScaleMode};
 use ruffle_render::quality::StageQuality;
 use ruffle_render_wgpu::clap::{GraphicsBackend, PowerPreference};
 use std::path::Path;
+use std::time::Duration;
 use url::Url;
 
-#[derive(Parser, Debug)]
+fn get_default_save_directory() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .expect("Couldn't find a valid data_local dir")
+        .join("ruffle")
+        .join("SharedObjects")
+}
+
+fn get_default_config_directory() -> std::path::PathBuf {
+    dirs::config_local_dir()
+        .expect("Couldn't find a valid config_local dir")
+        .join("ruffle")
+}
+
+#[derive(Parser, Debug, Clone)]
 #[clap(
     name = "Ruffle",
     author,
@@ -26,14 +42,25 @@ pub struct Opt {
     parameters: Vec<String>,
 
     /// Type of graphics backend to use. Not all options may be supported by your current system.
+    ///
     /// Default will attempt to pick the most supported graphics backend.
-    #[clap(long, short, default_value = "default")]
-    pub graphics: GraphicsBackend,
+    /// This option temporarily overrides any stored preference.
+    #[clap(long, short)]
+    pub graphics: Option<GraphicsBackend>,
 
     /// Power preference for the graphics device used. High power usage tends to prefer dedicated GPUs,
     /// whereas a low power usage tends prefer integrated GPUs.
-    #[clap(long, short, default_value = "high")]
-    pub power: PowerPreference,
+    ///
+    /// Default preference is high (likely dedicated GPU).
+    /// This option temporarily overrides any stored preference.
+    #[clap(long, short)]
+    pub power: Option<PowerPreference>,
+
+    /// Type of storage backend to use. This determines where local storage data is saved (e.g. shared objects).
+    ///
+    /// This option temporarily overrides any stored preference.
+    #[clap(long)]
+    pub storage: Option<StorageBackend>,
 
     /// Width of window in pixels.
     #[clap(long, display_order = 1)]
@@ -44,8 +71,8 @@ pub struct Opt {
     pub height: Option<f64>,
 
     /// Maximum number of seconds a script can run before scripting is disabled.
-    #[clap(long, short, default_value = "Infinity")]
-    pub max_execution_duration: f64,
+    #[clap(long, short, value_parser(parse_duration_seconds))]
+    pub max_execution_duration: Option<Duration>,
 
     /// Base directory or URL used to resolve all relative path statements in the SWF file.
     /// The default is the current directory.
@@ -53,11 +80,11 @@ pub struct Opt {
     pub base: Option<Url>,
 
     /// Default quality of the movie.
-    #[clap(long, short, default_value = "high")]
-    pub quality: StageQuality,
+    #[clap(long, short)]
+    pub quality: Option<StageQuality>,
 
     /// The alignment of the stage.
-    #[clap(long, short)]
+    #[clap(long, short, value_parser(parse_align))]
     pub align: Option<StageAlign>,
 
     /// Prevent movies from changing the stage alignment.
@@ -65,12 +92,12 @@ pub struct Opt {
     pub force_align: bool,
 
     /// The scale mode of the stage.
-    #[clap(long, short, default_value = "show-all")]
-    pub scale: StageScaleMode,
+    #[clap(long, short)]
+    pub scale: Option<StageScaleMode>,
 
-    /// Audio volume as a number between 0 (muted) and 1 (full volume)
-    #[clap(long, short, default_value = "1.0")]
-    pub volume: f32,
+    /// Audio volume as a number between 0 (muted) and 1 (full volume). Default is 1.
+    #[clap(long, short)]
+    pub volume: Option<f32>,
 
     /// Prevent movies from changing the stage scale mode.
     #[clap(long, action)]
@@ -81,6 +108,16 @@ pub struct Opt {
     #[cfg(feature = "render_trace")]
     trace_path: Option<std::path::PathBuf>,
 
+    /// Location to store save data for games.
+    ///
+    /// This option has no effect if `storage` is not `disk`.
+    #[clap(long, default_value_os_t=get_default_save_directory())]
+    pub save_directory: std::path::PathBuf,
+
+    /// Location of a directory to store Ruffle configuration.
+    #[clap(long, default_value_os_t=get_default_config_directory())]
+    pub config: std::path::PathBuf,
+
     /// Proxy to use when loading movies via URL.
     #[clap(long)]
     pub proxy: Option<Url>,
@@ -90,8 +127,8 @@ pub struct Opt {
     pub socket_allow: Vec<String>,
 
     /// Define how to deal with TCP Socket connections.
-    #[clap(long = "tcp-connections", default_value = "ask")]
-    pub tcp_connections: SocketMode,
+    #[clap(long = "tcp-connections")]
+    pub tcp_connections: Option<SocketMode>,
 
     /// Replace all embedded HTTP URLs with HTTPS.
     #[clap(long, action)]
@@ -101,27 +138,33 @@ pub struct Opt {
     #[clap(long, action)]
     pub fullscreen: bool,
 
-    #[clap(long, action)]
-    pub timedemo: bool,
-
-    #[clap(long, default_value = "streaming")]
-    pub load_behavior: LoadBehavior,
+    #[clap(long)]
+    pub load_behavior: Option<LoadBehavior>,
 
     /// Specify how Ruffle should handle areas outside the movie stage.
-    #[clap(long, default_value = "on")]
-    pub letterbox: Letterbox,
+    #[clap(long)]
+    pub letterbox: Option<Letterbox>,
 
     /// Spoofs the root SWF URL provided to ActionScript.
     #[clap(long, value_parser)]
     pub spoof_url: Option<Url>,
+
+    /// Spoofs the HTTP referer header.
+    #[clap(long, value_parser)]
+    pub referer: Option<Url>,
+
+    /// Spoofs the HTTP cookie header.
+    /// This is a string of the form "name1=value1; name2=value2".
+    #[clap(long)]
+    pub cookie: Option<String>,
 
     /// The version of the player to emulate
     #[clap(long)]
     pub player_version: Option<u8>,
 
     /// The runtime to emulate (Flash Player or Adobe AIR)
-    #[clap(long, default_value = "flash-player")]
-    pub player_runtime: PlayerRuntime,
+    #[clap(long)]
+    pub player_runtime: Option<PlayerRuntime>,
 
     /// Set and lock the player's frame rate, overriding the movie's frame rate.
     #[clap(long)]
@@ -140,10 +183,90 @@ pub struct Opt {
     /// Hides the menu bar (the bar at the top of the window).
     #[clap(long)]
     pub no_gui: bool,
+
+    /// Remaps a specific button on a gamepad to a keyboard key.
+    /// This can be used to add new gamepad support to existing games, for example mapping
+    /// the D-pad to the arrow keys with -B d-pad-up=up -B d-pad-down=down etc.
+    ///
+    /// A case-insensitive list of supported gamepad-buttons is:
+    /// - north, east, south, west
+    /// - d-pad-up, d-pad-down, d-pad-left, d-pad-right
+    /// - left-trigger, left-trigger2
+    /// - right-trigger, right-trigger2
+    /// - select, start
+    ///
+    /// A case-insensitive (non-exhaustive) list of common key-names is:
+    /// - a, b, c, ..., z
+    /// - up, down, left, right
+    /// - return
+    /// - space
+    /// - comma, semicolon
+    /// - key0, key1, ..., key9
+    /// The complete list of supported key-names can be found by using -B start=nonexistent.
+    #[clap(
+        long,
+        short = 'B',
+        value_parser(parse_gamepad_button),
+        verbatim_doc_comment,
+        value_name = "GAMEPAD BUTTON>=<KEY NAME"
+    )]
+    pub gamepad_button: Vec<(GamepadButton, KeyCode)>,
+
+    /// Disable AVM2 optimizer.
+    /// Note that some early opcode conversions
+    /// (like inlining constant pool entries) can't be disabled.
+    #[clap(long)]
+    pub no_avm2_optimizer: bool,
 }
 
 fn parse_movie_file_or_url(path: &str) -> Result<Url, Error> {
     crate::util::parse_url(Path::new(path))
+}
+
+fn parse_duration_seconds(value: &str) -> Result<Duration, Error> {
+    Ok(Duration::from_secs_f64(value.parse()?))
+}
+
+fn parse_align(value: &str) -> Result<StageAlign, Error> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid stage alignment"))
+}
+
+fn parse_gamepad_button(mapping: &str) -> Result<(GamepadButton, KeyCode), Error> {
+    let pos = mapping.find('=').ok_or_else(|| {
+        anyhow!("invalid <gamepad button>=<key name>: no `=` found in `{mapping}`")
+    })?;
+
+    fn to_aliases<T: ValueEnum>(variants: &[T]) -> String {
+        let aliases: Vec<String> = variants
+            .iter()
+            .map(|variant| {
+                variant
+                    .to_possible_value()
+                    .expect("Must have a PossibleValue")
+                    .get_name_and_aliases()
+                    .next()
+                    .expect("Must have one alias")
+                    .to_owned()
+            })
+            .collect();
+        aliases.join(", ")
+    }
+
+    let button = GamepadButton::from_str(&mapping[..pos], true).map_err(|err| {
+        anyhow!(
+            "Could not parse <gamepad button>: {err}\n  The possible values are: {}",
+            to_aliases(GamepadButton::value_variants())
+        )
+    })?;
+    let key_code = KeyCode::from_str(&mapping[pos + 1..], true).map_err(|err| {
+        anyhow!(
+            "Could not parse <key name>: {err}\n  The possible values are: {}",
+            to_aliases(KeyCode::value_variants())
+        )
+    })?;
+    Ok((button, key_code))
 }
 
 impl Opt {

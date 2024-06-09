@@ -1,7 +1,7 @@
 //! Default AVM2 object impl
 
 use crate::avm2::activation::Activation;
-use crate::avm2::dynamic_map::{DynamicMap, StringOrObject};
+use crate::avm2::dynamic_map::{DynamicKey, DynamicMap};
 use crate::avm2::error;
 use crate::avm2::object::{ClassObject, FunctionObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
@@ -41,7 +41,7 @@ pub struct ScriptObjectWeak<'gc>(pub GcWeakCell<'gc, ScriptObjectData<'gc>>);
 #[collect(no_drop)]
 pub struct ScriptObjectData<'gc> {
     /// Values stored on this object.
-    pub values: DynamicMap<StringOrObject<'gc>, Value<'gc>>,
+    pub values: DynamicMap<DynamicKey<'gc>, Value<'gc>>,
 
     /// Slots stored on this object.
     slots: Vec<Value<'gc>>,
@@ -75,6 +75,16 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
 
     fn value_of(&self, _mc: &Mutation<'gc>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
+    }
+}
+
+fn maybe_int_property(name: AvmString<'_>) -> DynamicKey<'_> {
+    // TODO: this should use a custom implementation, not parse()
+    // FP is much stricter here, only allowing pure natural numbers without sign or leading zeros
+    if let Ok(val) = name.parse::<u32>() {
+        DynamicKey::Uint(val)
+    } else {
+        DynamicKey::String(name)
     }
 }
 
@@ -137,6 +147,13 @@ impl<'gc> ScriptObjectData<'gc> {
         }
     }
 
+    /// Retrieve the values stored directly on this ScriptObjectData.
+    ///
+    /// This should only be used for debugging purposes.
+    pub fn values(&self) -> &DynamicMap<DynamicKey<'gc>, Value<'gc>> {
+        &self.values
+    }
+
     pub fn get_property_local(
         &self,
         multiname: &Multiname<'gc>,
@@ -161,10 +178,10 @@ impl<'gc> ScriptObjectData<'gc> {
             ));
         };
 
-        let value = self
-            .values
-            .as_hashmap()
-            .get(&StringOrObject::String(local_name));
+        // Unbelievably cursed special case in avmplus:
+        // https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/ScriptObject.cpp#L195-L199
+        let key = maybe_int_property(local_name);
+        let value = self.values.as_hashmap().get(&key);
         if let Some(value) = value {
             return Ok(value.value);
         }
@@ -173,10 +190,7 @@ impl<'gc> ScriptObjectData<'gc> {
         let mut proto = self.proto();
         while let Some(obj) = proto {
             let obj = obj.base();
-            let value = obj
-                .values
-                .as_hashmap()
-                .get(&StringOrObject::String(local_name));
+            let value = obj.values.as_hashmap().get(&key);
             if let Some(value) = value {
                 return Ok(value.value);
             }
@@ -222,8 +236,11 @@ impl<'gc> ScriptObjectData<'gc> {
             ));
         };
 
-        self.values
-            .insert(StringOrObject::String(local_name), value);
+        // Unbelievably cursed special case in avmplus:
+        // https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/ScriptObject.cpp#L311-L315
+        let key = maybe_int_property(local_name);
+
+        self.values.insert(key, value);
         Ok(())
     }
 
@@ -241,7 +258,8 @@ impl<'gc> ScriptObjectData<'gc> {
             return false;
         }
         if let Some(name) = multiname.local_name() {
-            self.values.remove(&StringOrObject::String(name));
+            let key = maybe_int_property(name);
+            self.values.remove(&key);
             true
         } else {
             false
@@ -257,21 +275,6 @@ impl<'gc> ScriptObjectData<'gc> {
 
     /// Set a slot by its index.
     pub fn set_slot(
-        &mut self,
-        id: u32,
-        value: Value<'gc>,
-        _mc: &Mutation<'gc>,
-    ) -> Result<(), Error<'gc>> {
-        if let Some(slot) = self.slots.get_mut(id as usize) {
-            *slot = value;
-            Ok(())
-        } else {
-            Err(format!("Slot index {id} out of bounds!").into())
-        }
-    }
-
-    /// Initialize a slot by its index.
-    pub fn init_slot(
         &mut self,
         id: u32,
         value: Value<'gc>,
@@ -330,11 +333,8 @@ impl<'gc> ScriptObjectData<'gc> {
     pub fn has_own_dynamic_property(&self, name: &Multiname<'gc>) -> bool {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
-                return self
-                    .values
-                    .as_hashmap()
-                    .get(&StringOrObject::String(name))
-                    .is_some();
+                let key = maybe_int_property(name);
+                return self.values.as_hashmap().get(&key).is_some();
             }
         }
         false
@@ -358,32 +358,25 @@ impl<'gc> ScriptObjectData<'gc> {
 
     pub fn get_enumerant_name(&self, index: u32) -> Option<Value<'gc>> {
         self.values.key_at(index as usize).map(|key| match key {
-            StringOrObject::String(name) => Value::String(*name),
-            StringOrObject::Object(obj) => Value::Object(*obj),
+            DynamicKey::String(name) => Value::String(*name),
+            DynamicKey::Object(obj) => Value::Object(*obj),
+            DynamicKey::Uint(val) => Value::Number(*val as f64),
         })
     }
 
     pub fn property_is_enumerable(&self, name: AvmString<'gc>) -> bool {
+        let key = maybe_int_property(name);
         self.values
             .as_hashmap()
-            .get(&StringOrObject::String(name))
+            .get(&key)
             .map_or(false, |prop| prop.enumerable)
     }
 
     pub fn set_local_property_is_enumerable(&mut self, name: AvmString<'gc>, is_enumerable: bool) {
-        if let Some(val) = self
-            .values
-            .as_hashmap()
-            .get(&StringOrObject::String(name))
-            .copied()
-        {
-            if is_enumerable {
-                self.values.insert(StringOrObject::String(name), val.value)
-            } else {
-                self.values
-                    .insert_no_enum(StringOrObject::String(name), val.value)
-            }
-        }
+        let key = maybe_int_property(name);
+        self.values.entry(key).and_modify(|v| {
+            v.enumerable = is_enumerable;
+        });
     }
 
     /// Install a method into the object.
@@ -408,7 +401,7 @@ impl<'gc> ScriptObjectData<'gc> {
 
     pub fn is_sealed(&self) -> bool {
         self.instance_of()
-            .map(|cls| cls.inner_class_definition().read().is_sealed())
+            .map(|cls| cls.inner_class_definition().is_sealed())
             .unwrap_or(false)
     }
 

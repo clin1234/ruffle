@@ -137,7 +137,7 @@ fn take_screenshot(
 
         player.lock().unwrap().run_frame();
         if i >= skipframes {
-            match catch_unwind(|| {
+            let image = || {
                 player.lock().unwrap().render();
                 let mut player = player.lock().unwrap();
                 let renderer = player
@@ -145,7 +145,8 @@ fn take_screenshot(
                     .downcast_mut::<WgpuRenderBackend<TextureTarget>>()
                     .unwrap();
                 renderer.capture_frame()
-            }) {
+            };
+            match catch_unwind(image) {
                 Ok(Some(image)) => result.push(image),
                 Ok(None) => return Err(anyhow!("Unable to capture frame {} of {:?}", i, swf_path)),
                 Err(e) => {
@@ -243,10 +244,7 @@ fn capture_single_swf(descriptors: Arc<Descriptors>, opt: &Opt) -> Result<()> {
         if opt.output_path == Some(PathBuf::from("-")) {
             let mut bytes: Vec<u8> = Vec::new();
             image
-                .write_to(
-                    &mut io::Cursor::new(&mut bytes),
-                    image::ImageOutputFormat::Png,
-                )
+                .write_to(&mut io::Cursor::new(&mut bytes), image::ImageFormat::Png)
                 .expect("Encoding failed");
             io::stdout()
                 .write_all(bytes.as_slice())
@@ -403,7 +401,7 @@ fn main() -> Result<()> {
     let opt: Opt = Opt::parse();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: opt.graphics.into(),
-        dx12_shader_compiler: wgpu::Dx12Compiler::default(),
+        ..Default::default()
     });
     let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
         opt.graphics.into(),

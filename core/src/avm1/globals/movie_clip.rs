@@ -9,9 +9,7 @@ use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{self, ArrayObject, Object, ScriptObject, TObject, Value};
 use crate::backend::navigator::NavigationMethod;
 use crate::context::{GcContext, UpdateContext};
-use crate::display_object::{
-    Bitmap, DisplayObject, EditText, MovieClip, TDisplayObject, TDisplayObjectContainer,
-};
+use crate::display_object::{Bitmap, EditText, MovieClip, TInteractiveObject};
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::prelude::*;
 use crate::string::AvmString;
@@ -20,7 +18,7 @@ use crate::{avm1_stub, avm_error, avm_warn};
 use ruffle_render::shape_utils::{DrawCommand, GradientType};
 use swf::{
     FillStyle, Fixed8, Gradient, GradientInterpolation, GradientRecord, GradientSpread,
-    LineCapStyle, LineJoinStyle, LineStyle, Rectangle, Twips,
+    LineCapStyle, LineJoinStyle, LineStyle,
 };
 
 macro_rules! mc_method {
@@ -118,6 +116,10 @@ const PROTO_DECLS: &[Declaration] = declare_properties! {
     "transform" => property(mc_getter!(transform), mc_setter!(set_transform); DONT_ENUM | VERSION_8);
     "useHandCursor" => bool(true; DONT_ENUM);
     // NOTE: `focusEnabled` is not a built-in property of MovieClip.
+    // NOTE: `tabEnabled` is not a built-in property of MovieClip.
+    // NOTE: `tabIndex` is not enumerable in MovieClip, contrary to Button and TextField
+    "tabIndex" => property(mc_getter!(tab_index), mc_setter!(set_tab_index); DONT_ENUM | VERSION_6);
+    // NOTE: `tabChildren` is not a built-in property of MovieClip.
 };
 
 /// Implements `MovieClip`
@@ -236,7 +238,7 @@ pub fn hit_test<'gc>(
             // The docs say the point is in "Stage coordinates", but actually they are in root coordinates.
             // root can be moved via _root._x etc., so we actually have to transform from root to world space.
             let local = Point::from_pixels(x, y);
-            let point = movie_clip.avm1_root().local_to_global(local);
+            let point = movie_clip.avm1_root_no_lock().local_to_global(local);
             let ret = if shape {
                 movie_clip.hit_test_shape(
                     &mut activation.context,
@@ -297,10 +299,11 @@ fn attach_bitmap<'gc>(
 
                 //TODO: do attached BitmapDatas have character ids?
                 let display_object = Bitmap::new_with_bitmap_data(
-                    &mut activation.context,
+                    activation.context.gc_context,
                     0,
                     bitmap_data,
                     smoothing,
+                    &movie_clip.movie(),
                 );
                 movie_clip.replace_at_depth(&mut activation.context, display_object.into(), depth);
                 display_object.post_instantiation(
@@ -825,7 +828,7 @@ fn attach_movie<'gc>(
         .context
         .library
         .library_for_movie(movie_clip.movie())
-        .ok_or("Movie is missing!")
+        .ok_or("Movie is missing!".into())
         .and_then(|l| l.instantiate_by_export_name(export_name, activation.context.gc_context))
     {
         // Set name and attach to parent.
@@ -895,26 +898,28 @@ fn create_text_field<'gc>(
         .cloned()
         .unwrap_or(Value::Undefined)
         .coerce_to_f64(activation)?;
+
+    // x, y, width, and height are integers here
     let x = args
         .get(2)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let y = args
         .get(3)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let width = args
         .get(4)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
     let height = args
         .get(5)
         .cloned()
         .unwrap_or(Value::Undefined)
-        .coerce_to_f64(activation)?;
+        .coerce_to_i32(activation)? as f64;
 
     let text_field: DisplayObject<'gc> =
         EditText::new(&mut activation.context, movie, x, y, width, height).into();
@@ -1242,7 +1247,7 @@ fn start_drag<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let lock_center = args
         .get(0)
-        .map(|o| o.as_bool(activation.context.swf.version()))
+        .map(|o| o.as_bool(activation.swf_version()))
         .unwrap_or(false);
 
     let constraint_args = if args.len() > 1 {
@@ -1503,8 +1508,8 @@ fn get_bounds<'gc>(
             Some(activation.context.avm1.prototypes().object),
         );
         out.set("xMin", out_bounds.x_min.to_pixels().into(), activation)?;
-        out.set("yMin", out_bounds.y_min.to_pixels().into(), activation)?;
         out.set("xMax", out_bounds.x_max.to_pixels().into(), activation)?;
+        out.set("yMin", out_bounds.y_min.to_pixels().into(), activation)?;
         out.set("yMax", out_bounds.y_max.to_pixels().into(), activation)?;
         Ok(out.into())
     } else {
@@ -1818,5 +1823,37 @@ fn set_filters<'gc>(
         }
     }
     this.set_filters(activation.context.gc_context, filters);
+    Ok(())
+}
+
+fn tab_index<'gc>(
+    this: MovieClip<'gc>,
+    _activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(index) = this.as_interactive().and_then(|this| this.tab_index()) {
+        Ok(Value::Number(index as f64))
+    } else {
+        Ok(Value::Undefined)
+    }
+}
+
+fn set_tab_index<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    if let Some(this) = this.as_interactive() {
+        let value = match value {
+            Value::Undefined | Value::Null => None,
+            Value::Bool(_) | Value::Number(_) => {
+                // FIXME This coercion is not perfect, as it wraps
+                //       instead of falling back to MIN, as FP does
+                let i32_value = value.coerce_to_i32(activation)?;
+                Some(i32_value)
+            }
+            _ => Some(i32::MIN),
+        };
+        this.set_tab_index(&mut activation.context, value);
+    }
     Ok(())
 }

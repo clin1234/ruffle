@@ -1,7 +1,7 @@
 //! `flash.text.TextField` builtin/prototype
 
 use crate::avm2::activation::Activation;
-use crate::avm2::error::make_error_2008;
+use crate::avm2::error::{make_error_2006, make_error_2008};
 use crate::avm2::globals::flash::display::display_object::initialize_for_allocator;
 use crate::avm2::object::{ClassObject, Object, TObject, TextFormatObject};
 use crate::avm2::parameters::ParametersExt;
@@ -23,7 +23,7 @@ pub fn text_field_allocator<'gc>(
     let orig_class = class;
     while let Some(class) = class_object {
         if class == textfield_cls {
-            let movie = activation.context.swf.clone();
+            let movie = activation.caller_movie_or_root();
             let display_object =
                 EditText::new(&mut activation.context, movie, 0.0, 0.0, 100.0, 100.0).into();
             return initialize_for_allocator(activation, display_object, orig_class);
@@ -889,7 +889,7 @@ pub fn set_text_format<'gc>(
                 }
 
                 if begin_index as usize > this.text_length() {
-                    return Err("RangeError: The supplied index is out of bounds.".into());
+                    return Err(make_error_2006(activation));
                 }
 
                 if end_index < 0 {
@@ -897,7 +897,7 @@ pub fn set_text_format<'gc>(
                 }
 
                 if end_index as usize > this.text_length() {
-                    return Err("RangeError: The supplied index is out of bounds.".into());
+                    return Err(make_error_2006(activation));
                 }
 
                 this.set_text_format(
@@ -1121,11 +1121,7 @@ pub fn get_line_metrics<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     {
-        let line_num = args
-            .get(0)
-            .cloned()
-            .unwrap_or(Value::Undefined)
-            .coerce_to_i32(activation)?;
+        let line_num = args.get_i32(activation, 0)?;
         let metrics = this.layout_metrics(Some(line_num as usize));
 
         if let Some(metrics) = metrics {
@@ -1146,6 +1142,26 @@ pub fn get_line_metrics<'gc>(
         } else {
             return Err("RangeError".into());
         }
+    }
+
+    Ok(Value::Undefined)
+}
+
+pub fn get_line_text<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this
+        .as_display_object()
+        .and_then(|this| this.as_edit_text())
+    {
+        let line_num = args.get_i32(activation, 0)?;
+        return if let Some(text) = this.line_text(line_num as usize) {
+            Ok(AvmString::new(activation.gc(), text).into())
+        } else {
+            Err(make_error_2006(activation))
+        };
     }
 
     Ok(Value::Undefined)
@@ -1325,18 +1341,58 @@ pub fn set_mouse_wheel_enabled<'gc>(
 
 pub fn get_restrict<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
+    this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.text.TextField", "restrict");
-    Ok(Value::Null)
+    if let Some(this) = this
+        .as_display_object()
+        .and_then(|this| this.as_edit_text())
+    {
+        return match this.restrict() {
+            Some(value) => Ok(AvmString::new(activation.context.gc_context, value).into()),
+            None => Ok(Value::Null),
+        };
+    }
+
+    Ok(Value::Undefined)
 }
 
 pub fn set_restrict<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
+    this: Object<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this
+        .as_display_object()
+        .and_then(|this| this.as_edit_text())
+    {
+        this.set_restrict(
+            args.try_get_string(activation, 0)?.as_deref(),
+            &mut activation.context,
+        );
+    }
+    Ok(Value::Undefined)
+}
+
+pub fn get_selected_text<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_setter!(activation, "flash.text.TextField", "restrict");
-    Ok(Value::Undefined)
+    if let Some(this) = this
+        .as_display_object()
+        .and_then(|this| this.as_edit_text())
+    {
+        let text = this.text();
+        let mut selection = this
+            .selection()
+            .unwrap_or_else(|| TextSelection::for_position(0));
+        selection.clamp(text.len());
+
+        let start_index = selection.start();
+        let end_index = selection.end();
+
+        return Ok(AvmString::new(activation.context.gc(), &text[start_index..end_index]).into());
+    }
+    Ok("".into())
 }

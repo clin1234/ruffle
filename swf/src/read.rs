@@ -8,6 +8,7 @@ use crate::{
 use bitstream_io::BitRead;
 use byteorder::{LittleEndian, ReadBytesExt};
 use simple_asn1::ASN1Block;
+use std::borrow::Cow;
 use std::io::{self, Read};
 
 /// Parse a decompressed SWF.
@@ -214,7 +215,7 @@ fn make_lzma_reader<'a, R: Read + 'a>(
     // Bytes 0..5: LZMA properties
     // Bytes 5..13: Uncompressed length
     //
-    // To deal with the mangled header, use lzma_rs options to anually provide uncompressed length.
+    // To deal with the mangled header, use lzma_rs options to manually provide uncompressed length.
 
     // Read compressed length (ignored)
     let _ = input.read_u32::<LittleEndian>()?;
@@ -2155,12 +2156,12 @@ impl<'a> Reader<'a> {
     fn read_convolution_filter(&mut self) -> Result<ConvolutionFilter> {
         let num_matrix_cols = self.read_u8()?;
         let num_matrix_rows = self.read_u8()?;
-        let divisor = self.read_fixed16()?;
-        let bias = self.read_fixed16()?;
+        let divisor = self.read_f32()?;
+        let bias = self.read_f32()?;
         let num_entries = num_matrix_cols * num_matrix_rows;
         let mut matrix = Vec::with_capacity(num_entries as usize);
         for _ in 0..num_entries {
-            matrix.push(self.read_fixed16()?);
+            matrix.push(self.read_f32()?);
         }
         Ok(ConvolutionFilter {
             num_matrix_cols,
@@ -2496,7 +2497,7 @@ impl<'a> Reader<'a> {
             format,
             width,
             height,
-            data,
+            data: Cow::Borrowed(data),
         })
     }
 
@@ -2555,9 +2556,7 @@ pub fn read_compression_type<R: Read>(mut input: R) -> Result<Compression> {
 #[allow(clippy::unusual_byte_groupings)]
 pub mod tests {
     use super::*;
-    use crate::tag_code::TagCode;
     use crate::test_data;
-    use std::vec::Vec;
 
     fn reader(data: &[u8]) -> Reader<'_> {
         let default_version = 13;

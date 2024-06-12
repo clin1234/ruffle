@@ -1,15 +1,12 @@
 //! XML builtin and prototype
 
-use crate::avm2::api_version::ApiVersion;
-use crate::avm2::e4x::{name_to_multiname, E4XNode, E4XNodeKind};
+use crate::avm2::e4x::{name_to_multiname, E4XNamespace, E4XNode, E4XNodeKind};
 use crate::avm2::error::{make_error_1117, type_error};
 pub use crate::avm2::object::xml_allocator;
-use crate::avm2::object::{
-    E4XOrXml, NamespaceObject, QNameObject, TObject, XmlListObject, XmlObject,
-};
+use crate::avm2::object::{E4XOrXml, QNameObject, TObject, XmlListObject, XmlObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::string::AvmString;
-use crate::avm2::{Activation, ArrayObject, Error, Multiname, Namespace, Object, Value};
+use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Object, Value};
 use crate::avm2_stub_method;
 
 fn ill_formed_markup_err<'gc>(
@@ -121,7 +118,7 @@ pub fn name<'gc>(
     let xml = this.as_xml_object().unwrap();
 
     if let Some(local_name) = xml.local_name() {
-        let namespace = xml.namespace(activation);
+        let namespace = xml.namespace_object(activation, &[])?.namespace();
         let mut multiname = Multiname::new(namespace, local_name);
         multiname.set_is_attribute(xml.node().is_attribute());
         Ok(QNameObject::from_name(activation, multiname)?.into())
@@ -130,6 +127,7 @@ pub fn name<'gc>(
     }
 }
 
+// ECMA-357 13.4.4.35 XML.prototype.setName (name)
 pub fn set_name<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
@@ -138,37 +136,67 @@ pub fn set_name<'gc>(
     let xml = this.as_xml_object().unwrap();
     let node = xml.node();
 
-    let is_attribute_or_element = matches!(
-        &*node.kind(),
-        E4XNodeKind::Attribute(_)
-            | E4XNodeKind::ProcessingInstruction(_)
-            | E4XNodeKind::Element { .. }
-    );
-
-    if !is_attribute_or_element {
+    // 1. If x.[[Class]] ∈ {"text", "comment"}, return
+    if node.is_text() || node.is_comment() {
         return Ok(Value::Undefined);
     }
 
-    let new_name = args.get_value(0);
-
-    let new_name = if let Some(qname) = new_name.as_object().and_then(|q| q.as_qname_object()) {
-        let has_no_ns = qname.name().is_any_namespace()
-            || (qname.name().namespace_set().len() == 1
-                && qname.name().namespace_set()[0].is_public());
-        if !has_no_ns {
-            avm2_stub_method!(activation, "XML", "setName", "with QName namespaces");
+    let name = match args.get_value(0) {
+        // 2. If (Type(name) is Object) and (name.[[Class]] == "QName") and (name.uri == null)
+        Value::Object(Object::QNameObject(qname)) if qname.uri().is_none() => {
+            // a. Let name = name.localName
+            qname.local_name().into()
         }
-        qname.local_name()
-    } else {
-        new_name.coerce_to_string(activation)?
+        value => value,
     };
 
-    let is_name_valid = crate::avm2::e4x::is_xml_name(new_name);
-    if !is_name_valid {
-        return Err(make_error_1117(activation, new_name));
+    // 3. Let n be a new QName created if by calling the constructor new QName(name)
+    let new_name = activation
+        .avm2()
+        .classes()
+        .qname
+        .construct(activation, &[name])?
+        .as_qname_object()
+        .unwrap();
+
+    // NOTE: avmplus addition
+    if !crate::avm2::e4x::is_xml_name(new_name.local_name()) {
+        return Err(make_error_1117(activation, new_name.local_name()));
     }
 
-    node.set_local_name(new_name, activation.context.gc_context);
+    // 4. If x.[[Class]] == "processing-instruction", let n.uri be the empty string
+    // 6. Let ns be a new Namespace created as if by calling the constructor new Namespace(n.prefix, n.uri)
+    // TODO: QName doesn't have a prefix
+    let ns = if matches!(&*node.kind(), E4XNodeKind::ProcessingInstruction(_)) {
+        None
+    } else {
+        new_name
+            .uri()
+            .filter(|uri| !uri.is_empty())
+            .map(E4XNamespace::new_uri)
+    };
+
+    // 5. Let x.[[Name]] = n
+    node.set_namespace(ns, activation.gc());
+    node.set_local_name(new_name.local_name(), activation.gc());
+
+    // NOTE: avmplus addition
+    if let Some(ns) = ns {
+        // 7. If x.[[Class]] == "attribute"
+        if node.is_attribute() {
+            // 7.a. If x.[[Parent]] == null, return
+            // 7.b. Call x.[[Parent]].[[AddInScopeNamespace]](ns)
+            if let Some(parent) = node.parent() {
+                parent.add_in_scope_namespace(activation.gc(), ns);
+            }
+        }
+
+        // 7. If x.[[Class]] == "element"
+        if node.is_element() {
+            // 7.a. Call x.[[AddInScopeNamespace]](ns2)
+            node.add_in_scope_namespace(activation.gc(), ns);
+        }
+    }
 
     Ok(Value::Undefined)
 }
@@ -179,17 +207,15 @@ pub fn namespace_internal_impl<'gc>(
     this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "XML", "namespace");
+    let xml = this.as_xml_object().unwrap();
+    let node = xml.node();
 
-    // FIXME:
     // 1. Let y = x
     // 2. Let inScopeNS = { }
     // 3. While (y is not null)
     //     a. For each ns in y.[[InScopeNamespaces]]
     //     ....
-
-    let xml = this.as_xml_object().unwrap();
-    let node = xml.node();
+    let in_scope_ns = node.in_scope_namespaces();
 
     // 4. If prefix was not specified
     if args[0] == Value::Bool(false) {
@@ -205,28 +231,20 @@ pub fn namespace_internal_impl<'gc>(
         }
 
         // b. Return the result of calling the [[GetNamespace]] method of x.[[Name]] with argument inScopeNS
-        // FIXME: Use inScopeNS
-        let namespace = xml.namespace(activation);
-        Ok(NamespaceObject::from_namespace(activation, namespace)?.into())
+        Ok(xml.namespace_object(activation, &in_scope_ns)?.into())
     } else {
         // a. Let prefix = ToString(prefix)
         let prefix = args.get_string(activation, 1)?;
 
         // b. Find a Namespace ns ∈ inScopeNS, such that ns.prefix = prefix. If no such ns exists, let ns = undefined.
         // c. Return ns
-
-        // FIXME: Nodes currently either have zero or one namespace, which has the prefix "" (empty string)
-        Ok(match node.namespace() {
-            Some(ns) if prefix.is_empty() => {
-                let namespace = Namespace::package(
-                    ns.uri,
-                    ApiVersion::AllVersions,
-                    &mut activation.context.borrow_gc(),
-                );
-                NamespaceObject::from_namespace(activation, namespace)?.into()
-            }
-            _ => Value::Undefined,
-        })
+        Ok(
+            if let Some(ns) = in_scope_ns.iter().find(|ns| ns.prefix == Some(prefix)) {
+                ns.as_namespace_object(activation)?.into()
+            } else {
+                Value::Undefined
+            },
+        )
     }
 }
 
@@ -234,9 +252,29 @@ pub fn namespace_internal_impl<'gc>(
 pub fn add_namespace<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
-    _args: &[Value<'gc>],
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "XML", "addNamespace");
+    let xml = this.as_xml_object().unwrap();
+    let node = xml.node();
+
+    // 1. Let ns a Namespace constructed as if by calling the function Namespace(namespace)
+    let value = args.get_value(0);
+    let ns = activation
+        .avm2()
+        .classes()
+        .namespace
+        .construct(activation, &[value])?
+        .as_namespace_object()
+        .unwrap();
+
+    // 2. Call the [[AddInScopeNamespace]] method of x with parameter ns
+    node.add_in_scope_namespace(
+        activation.gc(),
+        E4XNamespace {
+            prefix: ns.prefix(),
+            uri: ns.namespace().as_uri(),
+        },
+    );
 
     // 3. Return x
     Ok(this.into())
@@ -245,10 +283,55 @@ pub fn add_namespace<'gc>(
 // ECMA-357 13.4.4.36 XML.prototype.setNamespace (ns)
 pub fn set_namespace<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
-    _args: &[Value<'gc>],
+    this: Object<'gc>,
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "XML", "setNamespace");
+    let xml = this.as_xml_object().unwrap();
+    let node = xml.node();
+
+    // 1. If x.[[Class]] ∈ {"text", "comment", "processing-instruction"}, return
+    if matches!(
+        &*node.kind(),
+        E4XNodeKind::Text(_)
+            | E4XNodeKind::CData(_)
+            | E4XNodeKind::Comment(_)
+            | E4XNodeKind::ProcessingInstruction(_)
+    ) {
+        return Ok(Value::Undefined);
+    }
+
+    // 2. Let ns2 be a new Namespace created as if by calling the constructor new Namespace(ns)
+    let value = args.get_value(0);
+    let ns = activation
+        .avm2()
+        .classes()
+        .namespace
+        .construct(activation, &[value])?
+        .as_namespace_object()
+        .unwrap();
+    let ns = E4XNamespace {
+        prefix: ns.prefix(),
+        uri: ns.namespace().as_uri(),
+    };
+
+    // 3. Let x.[[Name]] be a new QName created as if by calling the constructor new QName(ns2, x.[[Name]])
+    node.set_namespace(Some(ns), activation.gc());
+
+    // 4. If x.[[Class]] == "attribute"
+    if node.is_attribute() {
+        // 4.a. If x.[[Parent]] == null, return
+        // 4.b. Call x.[[Parent]].[[AddInScopeNamespace]](ns2)
+        if let Some(parent) = node.parent() {
+            parent.add_in_scope_namespace(activation.gc(), ns);
+        }
+    }
+
+    // 5. If x.[[Class]] == "element"
+    if node.is_element() {
+        // 5.a. Call x.[[AddInScopeNamespace]](ns2)
+        node.add_in_scope_namespace(activation.gc(), ns);
+    }
+
     Ok(Value::Undefined)
 }
 
@@ -264,13 +347,37 @@ pub fn remove_namespace<'gc>(
     Ok(this.into())
 }
 
+// ECMA-357 13.4.4.17 XML.prototype.inScopeNamespaces ()
 pub fn in_scope_namespaces<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
+    this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "XML", "inScopeNamespaces");
-    Ok(ArrayObject::empty(activation)?.into())
+    let xml = this.as_xml_object().unwrap();
+    let node = xml.node();
+
+    // 1. Let y = x
+    // 2. Let inScopeNS = { }
+    // 3. While (y is not null)
+    // ...
+    let mut in_scope_ns: Vec<Value<'gc>> = Vec::new();
+    for ns in node.in_scope_namespaces() {
+        in_scope_ns.push(ns.as_namespace_object(activation)?.into());
+    }
+
+    // Note: Non-standard avmplus behavior doesn't allow an empty array.
+    if in_scope_ns.is_empty() {
+        in_scope_ns.push(
+            E4XNamespace::default_namespace()
+                .as_namespace_object(activation)?
+                .into(),
+        );
+    }
+
+    // 4. Let a be a new Array created as if by calling the constructor, new Array()
+    // ...
+    // 7. Return a
+    Ok(ArrayObject::from_storage(activation, ArrayStorage::from_iter(in_scope_ns))?.into())
 }
 
 pub fn namespace_declarations<'gc>(
@@ -287,11 +394,34 @@ pub fn namespace_declarations<'gc>(
         return Ok(ArrayObject::empty(activation)?.into());
     }
 
-    // TODO: (We are missing [[InScopeNamespaces]])
-    // Step 3. Let y = x.[[Parent]
+    // 3. Let y = x.[[Parent]]
+    // 4. Let ancestorNS = { }
+    // 5. While (y is not null)
     // ....
-    avm2_stub_method!(activation, "XML", "namespaceDeclarations");
-    Ok(ArrayObject::empty(activation)?.into())
+    // Note: in_scope_namespaces implements the whole loop
+    let ancestor_namespaces = node
+        .parent()
+        .map(|parent| parent.in_scope_namespaces())
+        .unwrap_or_default();
+
+    // 6. Let declaredNS = { }
+    let mut declared_namespaces: Vec<Value<'gc>> = Vec::new();
+
+    // 7. For each ns in x.[[InScopeNamespaces]]
+    for ns in node.in_scope_namespaces() {
+        // 7.a. If there exists no n ∈ ancestorNS, such that n.prefix == ns.prefix and n.uri == ns.uri
+        if !ancestor_namespaces.contains(&ns) {
+            // 7.a.i. Let declaredNS = declaredNS ∪ { ns }
+            declared_namespaces.push(ns.as_namespace_object(activation)?.into());
+        }
+    }
+
+    // 8. Let i = 0
+    // 9. For each ns in declaredNS
+    // 9.a. Call the [[Put]] method of a with arguments ToString(i) and ns
+    // 9.b. Let i = i + 1
+    // 10. Return a
+    Ok(ArrayObject::from_storage(activation, ArrayStorage::from_iter(declared_namespaces))?.into())
 }
 
 pub fn local_name<'gc>(

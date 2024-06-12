@@ -14,7 +14,7 @@ use crate::{avm2::TObject, xml::custom_unescape};
 
 use super::{
     error::{make_error_1010, make_error_1118, type_error},
-    object::{E4XOrXml, FunctionObject},
+    object::{E4XOrXml, FunctionObject, NamespaceObject},
     string::AvmString,
     Activation, Error, Multiname, Value,
 };
@@ -109,6 +109,34 @@ pub struct E4XNamespace<'gc> {
 impl<'gc> E4XNamespace<'gc> {
     pub fn new_uri(uri: AvmString<'gc>) -> Self {
         E4XNamespace { prefix: None, uri }
+    }
+
+    pub fn default_namespace() -> Self {
+        E4XNamespace {
+            prefix: None,
+            uri: "".into(),
+        }
+    }
+}
+
+impl<'gc> E4XNamespace<'gc> {
+    pub fn as_namespace_object(
+        &self,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<NamespaceObject<'gc>, Error<'gc>> {
+        let args = if let Some(prefix) = self.prefix {
+            vec![prefix.into(), self.uri.into()]
+        } else {
+            vec![self.uri.into()]
+        };
+        let obj = activation
+            .avm2()
+            .classes()
+            .namespace
+            .construct(activation, &args)?;
+        Ok(obj
+            .as_namespace_object()
+            .expect("just constructed a namespace"))
     }
 }
 
@@ -991,7 +1019,7 @@ impl<'gc> E4XNode<'gc> {
                     if &*name == b"xmlns" {
                         namespaces.push(E4XNamespace {
                             uri: value,
-                            prefix: None,
+                            prefix: Some("".into()),
                         });
                         continue;
                     }
@@ -1060,8 +1088,8 @@ impl<'gc> E4XNode<'gc> {
         Ok(result)
     }
 
-    pub fn set_namespace(&self, namespace: E4XNamespace<'gc>, mc: &Mutation<'gc>) {
-        self.0.write(mc).namespace = Some(namespace);
+    pub fn set_namespace(&self, namespace: Option<E4XNamespace<'gc>>, mc: &Mutation<'gc>) {
+        self.0.write(mc).namespace = namespace;
     }
 
     pub fn namespace(&self) -> Option<E4XNamespace<'gc>> {
@@ -1116,6 +1144,75 @@ impl<'gc> E4XNode<'gc> {
         }
 
         result
+    }
+
+    // ECMA-357 9.1.1.13 [[AddInScopeNamespace]] (N)
+    pub fn add_in_scope_namespace(&self, gc: &Mutation<'gc>, namespace: E4XNamespace<'gc>) {
+        // 1. If x.[[Class]] ∈ {"text", "comment", "processing-instruction", “attribute”}, return
+        if !self.is_element() {
+            return;
+        }
+
+        // 2. If N.prefix != undefined
+        let Some(prefix) = namespace.prefix else {
+            // 3. Return
+            return;
+        };
+
+        // 2.a. If N.prefix == "" and x.[[Name]].uri == "", return
+        if prefix.is_empty() && self.namespace().map_or(true, |ns| ns.uri.is_empty()) {
+            return;
+        }
+
+        {
+            let E4XNodeKind::Element {
+                ref mut namespaces, ..
+            } = &mut *self.kind_mut(gc)
+            else {
+                unreachable!("must be an element");
+            };
+
+            // 2.b. Let match be null
+            // 2.c. For each ns in x.[[InScopeNamespaces]]
+            // 2.c.i. If N.prefix == ns.prefix, let match = ns
+            let found_index = namespaces.iter().position(|ns| Some(prefix) == ns.prefix);
+
+            // 2.d. If match is not null and match.uri is not equal to N.uri
+            if let Some(found_index) = found_index {
+                if namespaces[found_index].uri != namespace.uri {
+                    // 2.d.i. Remove match from x.[[InScopeNamespaces]]
+                    namespaces.remove(found_index);
+                }
+            }
+
+            // 2.e. Let x.[[InScopeNamespaces]] = x.[[InScopeNamespaces]] ∪ { N }
+            namespaces.push(namespace);
+        }
+
+        // 2.f. If x.[[Name]].[[Prefix]] == N.prefix
+        match self.namespace() {
+            Some(self_ns) if self_ns.prefix == Some(prefix) => {
+                // 2.f.i. Let x.[[Name]].prefix = undefined
+                self.0.write(gc).namespace = Some(E4XNamespace::new_uri(self_ns.uri));
+            }
+            _ => {}
+        }
+
+        // 2.g. For each attr in x.[[Attributes]]
+        if let E4XNodeKind::Element {
+            ref mut attributes, ..
+        } = &mut *self.kind_mut(gc)
+        {
+            for attr in attributes.iter_mut() {
+                // 2.g.i. If attr.[[Name]].[[Prefix]] == N.prefix, let attr.[[Name]].prefix = undefined
+                match attr.namespace() {
+                    Some(attr_ns) if attr_ns.prefix == Some(prefix) => {
+                        attr.0.write(gc).namespace = Some(E4XNamespace::new_uri(attr_ns.uri));
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     // FIXME - avmplus constructs an actual QName here, and does the normal
@@ -1364,22 +1461,39 @@ fn to_xml_string_inner<'gc>(
 
     // 11. For each name in the set of names consisting of x.[[Name]] and
     //     the name of each attribute in x.[[Attributes]]
+
+    // TODO: Generate fake namespace prefixes when required.
+    let get_namespace = |namespace_declarations: &[E4XNamespace<'gc>], ns: &E4XNamespace<'gc>| {
+        ancestor_namespaces
+            .iter()
+            .chain(namespace_declarations.iter())
+            .find(|ancestor_ns| ancestor_ns.uri == ns.uri)
+            .copied()
+    };
+
     if let Some(ns) = node.namespace() {
-        if !ancestor_namespaces.contains(&ns) && !namespace_declarations.contains(&ns) {
+        if get_namespace(&namespace_declarations, &ns).is_none() {
             namespace_declarations.push(ns);
         }
     }
     for attribute in attributes {
-        // XXX Implement [[GetNamespace]]
         if let Some(ns) = attribute.namespace() {
-            if !ancestor_namespaces.contains(&ns) && !namespace_declarations.contains(&ns) {
+            if get_namespace(&namespace_declarations, &ns).is_none() {
                 namespace_declarations.push(ns);
             }
         }
     }
 
+    let get_prefix = |node: &E4XNode<'gc>| {
+        node.namespace().and_then(|ns| {
+            get_namespace(&namespace_declarations, &ns)
+                .and_then(|ns| ns.prefix)
+                .filter(|p| !p.is_empty())
+        })
+    };
+
     buf.push_char('<');
-    if let Some(prefix) = node.namespace().and_then(|ns| ns.prefix) {
+    if let Some(prefix) = get_prefix(&node) {
         buf.push_str(&prefix);
         buf.push_char(':');
     }
@@ -1388,7 +1502,7 @@ fn to_xml_string_inner<'gc>(
     for attribute in attributes {
         if let E4XNodeKind::Attribute(value) = &*attribute.kind() {
             buf.push_char(' ');
-            if let Some(prefix) = attribute.namespace().and_then(|ns| ns.prefix) {
+            if let Some(prefix) = get_prefix(attribute) {
                 buf.push_str(&prefix);
                 buf.push_char(':');
             }
@@ -1402,7 +1516,7 @@ fn to_xml_string_inner<'gc>(
 
     for ns in &namespace_declarations {
         buf.push_utf8(" xmlns");
-        if let Some(prefix) = ns.prefix {
+        if let Some(prefix) = ns.prefix.filter(|p| !p.is_empty()) {
             buf.push_char(':');
             buf.push_str(&prefix);
         }
@@ -1430,8 +1544,8 @@ fn to_xml_string_inner<'gc>(
         None
     };
 
-    let mut all_namespaces = namespace_declarations;
-    all_namespaces.extend_from_slice(ancestor_namespaces);
+    let mut all_namespaces = ancestor_namespaces.to_vec();
+    all_namespaces.extend_from_slice(&namespace_declarations);
 
     for child in children {
         if pretty.is_some() && indent_children {
@@ -1450,7 +1564,7 @@ fn to_xml_string_inner<'gc>(
     }
 
     buf.push_utf8("</");
-    if let Some(prefix) = node.namespace().and_then(|ns| ns.prefix) {
+    if let Some(prefix) = get_prefix(&node) {
         buf.push_str(&prefix);
         buf.push_char(':');
     }

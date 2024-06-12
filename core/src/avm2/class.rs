@@ -7,6 +7,7 @@ use crate::avm2::object::{ClassObject, Object};
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::traits::{Trait, TraitKind};
 use crate::avm2::value::Value;
+use crate::avm2::vtable::VTable;
 use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::Namespace;
@@ -17,9 +18,9 @@ use fnv::FnvHashMap;
 use gc_arena::{Collect, GcCell, Mutation};
 
 use std::cell::Ref;
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 
 use swf::avm2::types::{
     Class as AbcClass, Instance as AbcInstance, Method as AbcMethod, MethodBody as AbcMethodBody,
@@ -58,8 +59,8 @@ bitflags! {
 /// Parameters for the allocator are:
 ///
 ///  * `class` - The class object that is being allocated. This must be the
-///  current class (using a superclass will cause the wrong class to be
-///  read for traits).
+///    current class (using a superclass will cause the wrong class to be
+///    read for traits).
 ///  * `activation` - The current AVM2 activation.
 pub type AllocatorFn =
     for<'gc> fn(ClassObject<'gc>, &mut Activation<'_, 'gc>) -> Result<Object<'gc>, Error<'gc>>;
@@ -101,7 +102,13 @@ pub struct ClassData<'gc> {
 
     /// The list of interfaces this class directly implements. This does not include any
     /// superinterfaces, nor interfaces implemented by the superclass.
-    direct_interfaces: Vec<Multiname<'gc>>,
+    direct_interfaces: Vec<Class<'gc>>,
+
+    /// Interfaces implemented by this class, including interfaces
+    /// from parent classes and superinterfaces (recursively).
+    /// TODO - avoid cloning this when a subclass implements the
+    /// same interface as its superclass.
+    all_interfaces: Vec<Class<'gc>>,
 
     /// The instance allocator for this class.
     ///
@@ -137,6 +144,8 @@ pub struct ClassData<'gc> {
     /// properties that would match.
     instance_traits: Vec<Trait<'gc>>,
 
+    instance_vtable: VTable<'gc>,
+
     /// The class initializer for this class.
     ///
     /// Must be called once and only once prior to any use of this class.
@@ -160,7 +169,7 @@ pub struct ClassData<'gc> {
     /// Maps a type parameter to the application of this class with that parameter.
     ///
     /// Only applicable if this class is generic.
-    applications: FnvHashMap<Option<ClassKey<'gc>>, Class<'gc>>,
+    applications: FnvHashMap<Option<Class<'gc>>, Class<'gc>>,
 
     /// Whether or not this is a system-defined class.
     ///
@@ -181,29 +190,17 @@ impl PartialEq for Class<'_> {
     }
 }
 
+impl Eq for Class<'_> {}
+
+impl Hash for Class<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_ptr().hash(state);
+    }
+}
+
 impl<'gc> core::fmt::Debug for Class<'gc> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Class").field("name", &self.name()).finish()
-    }
-}
-
-/// Allows using a `Class<'gc>` as a HashMap key,
-/// using the pointer address for hashing/equality.
-#[derive(Collect, Copy, Clone)]
-#[collect(no_drop)]
-struct ClassKey<'gc>(Class<'gc>);
-
-impl PartialEq for ClassKey<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for ClassKey<'_> {}
-
-impl Hash for ClassKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0 .0.as_ptr().hash(state);
     }
 }
 
@@ -234,10 +231,12 @@ impl<'gc> Class<'gc> {
                 attributes: ClassAttributes::empty(),
                 protected_namespace: None,
                 direct_interfaces: Vec::new(),
+                all_interfaces: Vec::new(),
                 instance_allocator: None,
                 instance_init,
                 native_instance_init,
                 instance_traits: Vec::new(),
+                instance_vtable: VTable::empty(mc),
                 class_init,
                 class_initializer_called: false,
                 call_handler: None,
@@ -251,8 +250,7 @@ impl<'gc> Class<'gc> {
     }
 
     pub fn add_application(self, mc: &Mutation<'gc>, param: Option<Class<'gc>>, cls: Class<'gc>) {
-        let key = param.map(ClassKey);
-        self.0.write(mc).applications.insert(key, cls);
+        self.0.write(mc).applications.insert(param, cls);
     }
 
     /// Apply type parameters to an existing class.
@@ -267,9 +265,7 @@ impl<'gc> Class<'gc> {
         let mc = context.gc_context;
         let this_read = this.0.read();
 
-        let key = param.map(ClassKey);
-
-        if let Some(application) = this_read.applications.get(&key) {
+        if let Some(application) = this_read.applications.get(&param) {
             return *application;
         }
 
@@ -302,10 +298,13 @@ impl<'gc> Class<'gc> {
 
         new_class.set_param(mc, Some(Some(param)));
         new_class.0.write(mc).call_handler = object_vector_cls.call_handler();
+        new_class
+            .init_vtable(context)
+            .expect("Vector class doesn't have any interfaces, so `init_vtable` cannot error");
 
         drop(this_read);
 
-        this.0.write(mc).applications.insert(key, new_class);
+        this.0.write(mc).applications.insert(Some(param), new_class);
         new_class
     }
 
@@ -383,10 +382,18 @@ impl<'gc> Class<'gc> {
 
         let mut interfaces = Vec::with_capacity(abc_instance.interfaces.len());
         for interface_name in &abc_instance.interfaces {
+            let multiname = unit.pool_multiname_static(*interface_name, &mut activation.context)?;
+
             interfaces.push(
-                unit.pool_multiname_static(*interface_name, &mut activation.context)?
-                    .deref()
-                    .clone(),
+                activation
+                    .domain()
+                    .get_class(&mut activation.context, &multiname)
+                    .ok_or_else(|| {
+                        make_error_1014(
+                            activation,
+                            multiname.to_qualified_name(activation.context.gc_context),
+                        )
+                    })?,
             );
         }
 
@@ -449,10 +456,12 @@ impl<'gc> Class<'gc> {
                 attributes,
                 protected_namespace,
                 direct_interfaces: interfaces,
+                all_interfaces: Vec::new(),
                 instance_allocator,
                 instance_init,
                 native_instance_init,
                 instance_traits: Vec::new(),
+                instance_vtable: VTable::empty(activation.context.gc_context),
                 class_init,
                 class_initializer_called: false,
                 call_handler: native_call_handler,
@@ -588,6 +597,81 @@ impl<'gc> Class<'gc> {
         Ok(())
     }
 
+    pub fn init_vtable(self, context: &mut UpdateContext<'_, 'gc>) -> Result<(), Error<'gc>> {
+        let read = self.0.read();
+
+        if !read.traits_loaded {
+            panic!(
+                "Attempted to initialize vtable on a class that did not have its traits loaded yet"
+            );
+        }
+
+        read.instance_vtable.init_vtable(
+            self,
+            None,
+            &read.instance_traits,
+            None,
+            read.super_class.map(|c| c.instance_vtable()),
+            context,
+        );
+        drop(read);
+
+        self.link_interfaces(context)?;
+
+        Ok(())
+    }
+
+    pub fn link_interfaces(self, context: &mut UpdateContext<'_, 'gc>) -> Result<(), Error<'gc>> {
+        let mut interfaces = Vec::with_capacity(self.direct_interfaces().len());
+
+        let mut dedup = HashSet::new();
+        let mut queue = vec![self];
+        while let Some(cls) = queue.pop() {
+            for interface in &*cls.direct_interfaces() {
+                if !interface.is_interface() {
+                    return Err(format!(
+                        "Class {:?} is not an interface and cannot be implemented by classes",
+                        interface.name().local_name()
+                    )
+                    .into());
+                }
+
+                if dedup.insert(*interface) {
+                    queue.push(*interface);
+                    interfaces.push(*interface);
+                }
+            }
+
+            if let Some(super_class) = cls.super_class() {
+                queue.push(super_class);
+            }
+        }
+
+        // FIXME - we should only be copying properties for newly-implemented
+        // interfaces (i.e. those that were not already implemented by the superclass)
+        // Otherwise, our behavior diverges from Flash Player in certain cases.
+        // See the ignored test 'tests/tests/swfs/avm2/weird_superinterface_properties/'
+        for interface in &interfaces {
+            for interface_trait in &*interface.instance_traits() {
+                if !interface_trait.name().namespace().is_public() {
+                    let public_name = QName::new(
+                        context.avm2.public_namespace_vm_internal,
+                        interface_trait.name().local_name(),
+                    );
+                    self.0.read().instance_vtable.copy_property_for_interface(
+                        context.gc_context,
+                        public_name,
+                        interface_trait.name(),
+                    );
+                }
+            }
+        }
+
+        self.0.write(context.gc_context).all_interfaces = interfaces;
+
+        Ok(())
+    }
+
     pub fn for_activation(
         activation: &mut Activation<'_, 'gc>,
         translation_unit: TranslationUnit<'gc>,
@@ -606,7 +690,7 @@ impl<'gc> Class<'gc> {
             )?);
         }
 
-        Ok(Class(GcCell::new(
+        let class = Class(GcCell::new(
             activation.context.gc_context,
             ClassData {
                 name: QName::new(activation.avm2().public_namespace_base_version, name),
@@ -615,6 +699,7 @@ impl<'gc> Class<'gc> {
                 attributes: ClassAttributes::empty(),
                 protected_namespace: None,
                 direct_interfaces: Vec::new(),
+                all_interfaces: Vec::new(),
                 instance_allocator: None,
                 instance_init: Method::from_builtin(
                     |_, _, _| Ok(Value::Undefined),
@@ -627,6 +712,7 @@ impl<'gc> Class<'gc> {
                     activation.context.gc_context,
                 ),
                 instance_traits: traits,
+                instance_vtable: VTable::empty(activation.context.gc_context),
                 class_init: Method::from_builtin(
                     |_, _, _| Ok(Value::Undefined),
                     "<Activation object class constructor>",
@@ -640,7 +726,45 @@ impl<'gc> Class<'gc> {
                 applications: Default::default(),
                 class_objects: Vec::new(),
             },
-        )))
+        ));
+
+        class.init_vtable(&mut activation.context)?;
+
+        Ok(class)
+    }
+
+    /// Determine if this class has a given type in its superclass chain.
+    ///
+    /// The given class `test_class` should be either a superclass or
+    /// interface we are checking against this class.
+    ///
+    /// To test if a class *instance* is of a given type, see `Object::is_of_type`.
+    pub fn has_class_in_chain(self, test_class: Class<'gc>) -> bool {
+        let mut my_class = Some(self);
+
+        while let Some(class) = my_class {
+            if class == test_class {
+                return true;
+            }
+
+            my_class = class.super_class()
+        }
+
+        // A `Class` stores all of the interfaces it implements, including
+        // those from superinterfaces and superclasses (recursively).
+        if test_class.is_interface() {
+            for interface in &*self.all_interfaces() {
+                if *interface == test_class {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn instance_vtable(self) -> VTable<'gc> {
+        self.0.read().instance_vtable
     }
 
     pub fn name(self) -> QName<'gc> {
@@ -649,6 +773,26 @@ impl<'gc> Class<'gc> {
 
     pub fn try_name(self) -> Result<QName<'gc>, std::cell::BorrowError> {
         self.0.try_read().map(|r| r.name)
+    }
+
+    /// Attempts to obtain the name of this class.
+    /// If we are unable to read from the necessary `GcCell`,
+    /// the returned value will be some kind of error message.
+    ///
+    /// This should only be used in a debug context, where
+    /// we need infallible access to *something* to print
+    /// out.
+    pub fn debug_name(self) -> Box<dyn fmt::Debug + 'gc> {
+        let class_name = self.try_name();
+
+        match class_name {
+            Ok(class_name) => Box::new(class_name),
+            Err(err) => Box::new(err),
+        }
+    }
+
+    pub fn param(self) -> Option<Option<Class<'gc>>> {
+        self.0.read().param
     }
 
     pub fn set_param(self, mc: &Mutation<'gc>, param: Option<Option<Class<'gc>>>) {
@@ -667,6 +811,42 @@ impl<'gc> Class<'gc> {
         self.0.read().protected_namespace
     }
 
+    pub fn mark_traits_loaded(self, mc: &Mutation<'gc>) {
+        self.0.write(mc).traits_loaded = true;
+    }
+
+    #[inline(never)]
+    pub fn define_constant_class_instance_trait(
+        self,
+        activation: &mut Activation<'_, 'gc>,
+        name: QName<'gc>,
+        value: Value<'gc>,
+    ) {
+        self.define_instance_trait(
+            activation.context.gc_context,
+            Trait::from_const(
+                name,
+                Multiname::new(activation.avm2().public_namespace_base_version, "Class"),
+                Some(value),
+            ),
+        );
+    }
+    #[inline(never)]
+    pub fn define_constant_function_instance_trait(
+        self,
+        activation: &mut Activation<'_, 'gc>,
+        name: QName<'gc>,
+        value: Value<'gc>,
+    ) {
+        self.define_instance_trait(
+            activation.context.gc_context,
+            Trait::from_const(
+                name,
+                Multiname::new(activation.avm2().public_namespace_base_version, "Function"),
+                Some(value),
+            ),
+        );
+    }
     #[inline(never)]
     pub fn define_constant_number_class_traits(
         self,
@@ -941,12 +1121,12 @@ impl<'gc> Class<'gc> {
         self.0.write(mc).class_initializer_called = true;
     }
 
-    pub fn direct_interfaces(&self) -> Ref<Vec<Multiname<'gc>>> {
+    pub fn direct_interfaces(&self) -> Ref<Vec<Class<'gc>>> {
         Ref::map(self.0.read(), |c| &c.direct_interfaces)
     }
 
-    pub fn implements(self, mc: &Mutation<'gc>, iface: Multiname<'gc>) {
-        self.0.write(mc).direct_interfaces.push(iface)
+    pub fn all_interfaces(&self) -> Ref<Vec<Class<'gc>>> {
+        Ref::map(self.0.read(), |c| &c.all_interfaces)
     }
 
     /// Determine if this class is sealed (no dynamic properties)
@@ -970,20 +1150,5 @@ impl<'gc> Class<'gc> {
     /// Determine if this class is generic (can be specialized)
     pub fn is_generic(self) -> bool {
         self.0.read().attributes.contains(ClassAttributes::GENERIC)
-    }
-}
-
-pub struct ClassHashWrapper<'gc>(pub Class<'gc>);
-
-impl<'gc> PartialEq for ClassHashWrapper<'gc> {
-    fn eq(&self, other: &Self) -> bool {
-        GcCell::ptr_eq(self.0 .0, other.0 .0)
-    }
-}
-impl<'gc> Eq for ClassHashWrapper<'gc> {}
-
-impl<'gc> Hash for ClassHashWrapper<'gc> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0 .0.as_ptr().hash(state);
     }
 }

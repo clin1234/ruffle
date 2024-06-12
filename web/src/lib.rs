@@ -3,30 +3,23 @@
 
 //! Ruffle web frontend.
 mod audio;
+mod builder;
 mod external_interface;
 mod input;
 mod log_adapter;
 mod navigator;
 mod storage;
 mod ui;
+mod zip;
 
-use external_interface::{external_to_js_value, js_to_external_value, JavascriptInterface};
+use crate::builder::RuffleInstanceBuilder;
+use external_interface::{external_to_js_value, js_to_external_value};
 use input::{web_key_to_codepoint, web_to_ruffle_key_code, web_to_ruffle_text_control};
-use js_sys::{Error as JsError, Promise, Uint8Array};
-use ruffle_core::backend::navigator::OpenURLMode;
-use ruffle_core::backend::ui::FontDefinition;
-use ruffle_core::compatibility_rules::CompatibilityRules;
-use ruffle_core::config::{Letterbox, NetworkingAccessMode};
+use js_sys::{Error as JsError, Uint8Array};
 use ruffle_core::context::UpdateContext;
 use ruffle_core::events::{MouseButton, MouseWheelDelta, TextControlCode};
 use ruffle_core::tag_utils::SwfMovie;
-use ruffle_core::{swf, DefaultFont};
-use ruffle_core::{
-    Color, Player, PlayerBuilder, PlayerEvent, PlayerRuntime, SandboxType, StageAlign,
-    StageScaleMode, StaticCallstack, ViewportDimensions,
-};
-use ruffle_render::quality::StageQuality;
-use ruffle_video_software::backend::SoftwareVideoBackend;
+use ruffle_core::{Player, PlayerEvent, StaticCallstack, ViewportDimensions};
 use ruffle_web_common::JsResult;
 use serde::{Deserialize, Serialize};
 use slotmap::{new_key_type, SlotMap};
@@ -34,7 +27,6 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::{cell::RefCell, error::Error, num::NonZeroI32};
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::registry::Registry;
@@ -188,193 +180,13 @@ extern "C" {
     fn display_unsupported_video(this: &JavascriptPlayer, url: &str);
 }
 
-fn deserialize_color<'de, D>(deserializer: D) -> Result<Option<Color>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let color: Option<String> = serde::Deserialize::deserialize(deserializer)?;
-    let color = match color {
-        Some(color) => color,
-        None => return Ok(None),
-    };
-
-    // Parse classic HTML hex color (XXXXXX or #XXXXXX), attempting to match browser behavior.
-    // Optional leading #.
-    let color = color.strip_prefix('#').unwrap_or(&color);
-
-    // Fail if less than 6 digits.
-    let color = match color.get(..6) {
-        Some(color) => color,
-        None => return Ok(None),
-    };
-
-    let rgb = color.chars().fold(0, |acc, c| {
-        // Each char represents 4-bits. Invalid hex digit is allowed (converts to 0).
-        let digit = c.to_digit(16).unwrap_or_default();
-        (acc << 4) | digit
-    });
-    Ok(Some(Color::from_rgb(rgb, 255)))
-}
-
-fn deserialize_log_level<'de, D>(deserializer: D) -> Result<tracing::Level, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let value: String = serde::Deserialize::deserialize(deserializer)?;
-    tracing::Level::from_str(&value).map_err(Error::custom)
-}
-
-fn deserialize_player_runtime<'de, D>(deserializer: D) -> Result<PlayerRuntime, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value: String = serde::Deserialize::deserialize(deserializer)?;
-    Ok(match value.as_str() {
-        "air" => PlayerRuntime::AIR,
-        "flashPlayer" => PlayerRuntime::FlashPlayer,
-        _ => Default::default(),
-    })
-}
-
-fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    struct DurationVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for DurationVisitor {
-        type Value = Duration;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str(
-                "Either a non-negative number (indicating seconds) or a {secs: number, nanos: number}."
-            )
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where
-            E: Error,
-        {
-            Ok(Duration::from_secs_f64(if value < 1 {
-                1.0
-            } else {
-                value as f64
-            }))
-        }
-
-        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-        where
-            E: Error,
-        {
-            Ok(Duration::from_secs_f64(if value.is_nan() || value < 1.0 {
-                1.0
-            } else {
-                value
-            }))
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut secs = None;
-            let mut nanos = None;
-            while let Some(key) = map.next_key::<String>()? {
-                let key_s = key.as_str();
-
-                match key_s {
-                    "secs" => {
-                        if secs.is_some() {
-                            return Err(Error::duplicate_field("secs"));
-                        }
-                        secs = Some(map.next_value()?);
-                    }
-                    "nanos" => {
-                        if nanos.is_some() {
-                            return Err(Error::duplicate_field("nanos"));
-                        }
-                        nanos = Some(map.next_value()?);
-                    }
-                    _ => return Err(Error::unknown_field(key_s, &["secs", "nanos"])),
-                }
-            }
-            let secs = secs.ok_or_else(|| Error::missing_field("secs"))?;
-            let nanos = nanos.ok_or_else(|| Error::missing_field("nanos"))?;
-            Ok(Duration::new(secs, nanos))
-        }
-    }
-
-    deserializer.deserialize_any(DurationVisitor)
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SocketProxy {
     host: String,
     port: u16,
 
     proxy_url: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Config {
-    allow_script_access: bool,
-
-    #[serde(deserialize_with = "deserialize_color")]
-    background_color: Option<Color>,
-
-    letterbox: Letterbox,
-
-    upgrade_to_https: bool,
-
-    compatibility_rules: bool,
-
-    #[serde(rename = "base")]
-    base_url: Option<String>,
-
-    #[serde(rename = "menu")]
-    show_menu: bool,
-
-    allow_fullscreen: bool,
-
-    salign: Option<String>,
-
-    force_align: bool,
-
-    quality: Option<String>,
-
-    scale: Option<String>,
-
-    force_scale: bool,
-
-    frame_rate: Option<f64>,
-
-    wmode: Option<String>,
-
-    #[serde(deserialize_with = "deserialize_log_level")]
-    log_level: tracing::Level,
-
-    #[serde(deserialize_with = "deserialize_duration")]
-    max_execution_duration: Duration,
-
-    player_version: Option<u8>,
-
-    preferred_renderer: Option<String>,
-
-    open_url_mode: OpenURLMode,
-
-    allow_networking: NetworkingAccessMode,
-
-    socket_proxy: Vec<SocketProxy>,
-
-    credential_allow_list: Vec<String>,
-
-    #[serde(deserialize_with = "deserialize_player_runtime")]
-    player_runtime: PlayerRuntime,
 }
 
 /// Metadata about the playing SWF file to be passed back to JavaScript.
@@ -394,27 +206,6 @@ struct MovieMetadata {
 
 #[wasm_bindgen]
 impl RuffleHandle {
-    #[allow(clippy::new_ret_no_self)]
-    #[wasm_bindgen(constructor)]
-    pub fn new(parent: HtmlElement, js_player: JavascriptPlayer, config: JsValue) -> Promise {
-        wasm_bindgen_futures::future_to_promise(async move {
-            let config: Config = serde_wasm_bindgen::from_value(config)
-                .map_err(|e| format!("Error parsing config: {e}"))?;
-
-            if RUFFLE_GLOBAL_PANIC.is_completed() {
-                // If an actual panic happened, then we can't trust the state it left us in.
-                // Prevent future players from loading so that they can inform the user about the error.
-                return Err("Ruffle is panicking!".into());
-            }
-            set_panic_hook();
-
-            let ruffle = Self::new_internal(parent, js_player, config)
-                .await
-                .map_err(|err| JsValue::from(format!("Error creating player: {}", err)))?;
-            Ok(JsValue::from(ruffle))
-        })
-    }
-
     /// Stream an arbitrary movie file from (presumably) the Internet.
     ///
     /// This method should only be called once per player.
@@ -536,65 +327,6 @@ impl RuffleHandle {
         // Instance is dropped at this point.
     }
 
-    pub fn add_font(&mut self, font_name: &str, data: Uint8Array) {
-        let _ = self.with_core_mut(|core| {
-            let bytes: Vec<u8> = data.to_vec();
-            if let Ok(swf_stream) = swf::decompress_swf(&bytes[..]) {
-                if let Ok(swf) = swf::parse_swf(&swf_stream) {
-                    let encoding = swf::SwfStr::encoding_for_version(swf.header.version());
-                    for tag in swf.tags {
-                        match tag {
-                            swf::Tag::DefineFont(_font) => {
-                                tracing::warn!("DefineFont1 tag is not yet supported by Ruffle, inside font swf {font_name}");
-                            }
-                            swf::Tag::DefineFont2(font) => {
-                                tracing::debug!(
-                                    "Loaded font {} from font swf {font_name}",
-                                    font.name.to_str_lossy(encoding)
-                                );
-                                core.register_device_font(FontDefinition::SwfTag(*font, encoding));
-                            }
-                            swf::Tag::DefineFont4(font) => {
-                                let name = font.name.to_str_lossy(encoding);
-                                if let Some(data) = font.data {
-                                    tracing::debug!("Loaded font {name} from font swf {font_name}");
-                                    core.register_device_font(FontDefinition::FontFile { name: name.to_string(), is_bold: font.is_bold, is_italic: font.is_bold, data: data.to_vec(), index: 0 })
-                                } else {
-                                    tracing::warn!("Font {name} from font swf {font_name} contains no data");
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return;
-                }
-            }
-
-            tracing::warn!("Font source {font_name} was not recognised (not a valid SWF?)");
-        });
-    }
-
-    pub fn set_default_font(&mut self, default_name: &str, fonts: Vec<JsValue>) {
-        let _ = self.with_core_mut(|core| {
-            let default = match default_name {
-                "sans" => DefaultFont::Sans,
-                "serif" => DefaultFont::Serif,
-                "typewriter" => DefaultFont::Typewriter,
-                name => {
-                    tracing::error!("Unknown default font name '{name}'");
-                    return;
-                }
-            };
-            core.set_default_font(
-                default,
-                fonts
-                    .into_iter()
-                    .flat_map(|value| value.as_string())
-                    .collect(),
-            );
-        });
-    }
-
     #[allow(clippy::boxed_local)] // for js_bind
     pub fn call_exposed_callback(&self, name: &str, args: Box<[JsValue]>) -> JsValue {
         let args: Vec<_> = args.iter().map(js_to_external_value).collect();
@@ -646,169 +378,31 @@ impl RuffleHandle {
     async fn new_internal(
         parent: HtmlElement,
         js_player: JavascriptPlayer,
-        config: Config,
+        config: RuffleInstanceBuilder,
     ) -> Result<Self, Box<dyn Error>> {
-        // Redirect Log to Tracing if it isn't already
-        let _ = tracing_log::LogTracer::builder()
-            // wgpu crates are extremely verbose
-            .ignore_crate("wgpu_hal")
-            .ignore_crate("wgpu_core")
-            .init();
-        let log_subscriber = Arc::new(
-            Registry::default().with(WASMLayer::new(
-                WASMLayerConfigBuilder::new()
-                    .set_report_logs_in_timings(cfg!(feature = "profiling"))
-                    .set_max_level(config.log_level)
-                    .build(),
-            )),
-        );
+        let log_subscriber = config.create_log_subscriber();
         let _subscriber = tracing::subscriber::set_default(log_subscriber.clone());
-        let allow_script_access = config.allow_script_access;
-        let allow_networking = config.allow_networking;
-
         let window = web_sys::window().ok_or("Expected window")?;
-        let document = window.document().ok_or("Expected document")?;
 
-        let (mut builder, canvas) =
-            create_renderer(PlayerBuilder::new(), &document, &config).await?;
+        let player = config
+            .create_player(js_player.clone(), log_subscriber.clone())
+            .await?;
 
         parent
-            .append_child(&canvas.clone().into())
+            .append_child(&player.canvas.clone().into())
             .into_js_result()?;
 
-        if let Ok(audio) = audio::WebAudioBackend::new(log_subscriber.clone()) {
-            builder = builder.with_audio(audio);
-        } else {
-            tracing::error!("Unable to create audio backend. No audio will be played.");
-        }
-        builder = builder.with_navigator(navigator::WebNavigatorBackend::new(
-            allow_script_access,
-            allow_networking,
-            config.upgrade_to_https,
-            config.base_url,
-            log_subscriber.clone(),
-            config.open_url_mode,
-            config.socket_proxy,
-            config.credential_allow_list,
-        ));
-
-        match window.local_storage() {
-            Ok(Some(s)) => {
-                builder = builder.with_storage(Box::new(storage::LocalStorageBackend::new(s)));
-            }
-            err => {
-                tracing::warn!("Unable to use localStorage: {:?}\nData will not save.", err);
-            }
-        };
-
-        let default_quality = if ruffle_web_common::is_mobile_or_tablet() {
-            tracing::info!("Running on a mobile device; defaulting to low quality");
-            StageQuality::Low
-        } else {
-            StageQuality::High
-        };
-
-        // Create the external interface.
-        if allow_script_access && allow_networking == NetworkingAccessMode::All {
-            let interface = Box::new(JavascriptInterface::new(js_player.clone()));
-            builder = builder
-                .with_external_interface(interface.clone())
-                .with_fs_commands(interface);
-        }
-
-        let trace_observer = Rc::new(RefCell::new(JsValue::UNDEFINED));
-        let core = builder
-            .with_log(log_adapter::WebLogBackend::new(trace_observer.clone()))
-            .with_ui(ui::WebUiBackend::new(js_player.clone(), &canvas))
-            .with_video(SoftwareVideoBackend::new())
-            .with_letterbox(config.letterbox)
-            .with_max_execution_duration(config.max_execution_duration)
-            .with_player_version(config.player_version)
-            .with_player_runtime(config.player_runtime)
-            .with_compatibility_rules(if config.compatibility_rules {
-                CompatibilityRules::default()
-            } else {
-                CompatibilityRules::empty()
-            })
-            .with_quality(
-                config
-                    .quality
-                    .and_then(|q| {
-                        let quality = match q.to_ascii_lowercase().as_str() {
-                            "low" => StageQuality::Low,
-                            "medium" => StageQuality::Medium,
-                            "high" => StageQuality::High,
-                            "best" => StageQuality::Best,
-                            "8x8" => StageQuality::High8x8,
-                            "8x8linear" => StageQuality::High8x8Linear,
-                            "16x16" => StageQuality::High16x16,
-                            "16x16linear" => StageQuality::High16x16Linear,
-                            _ => return None,
-                        };
-
-                        Some(quality)
-                    })
-                    .unwrap_or(default_quality),
-            )
-            .with_align(
-                config
-                    .salign
-                    .map(|s| {
-                        // Chars get converted into flags.
-                        // This means "tbbtlbltblbrllrbltlrtbl" is valid, resulting in "TBLR".
-                        let mut align = StageAlign::default();
-                        for c in s.bytes().map(|c| c.to_ascii_uppercase()) {
-                            match c {
-                                b'T' => align.insert(StageAlign::TOP),
-                                b'B' => align.insert(StageAlign::BOTTOM),
-                                b'L' => align.insert(StageAlign::LEFT),
-                                b'R' => align.insert(StageAlign::RIGHT),
-                                _ => (),
-                            }
-                        }
-                        align
-                    })
-                    .unwrap_or_default(),
-                config.force_align,
-            )
-            .with_scale_mode(
-                config
-                    .scale
-                    .and_then(|s| {
-                        let scale_mode = match s.to_ascii_lowercase().as_str() {
-                            "exactfit" => StageScaleMode::ExactFit,
-                            "noborder" => StageScaleMode::NoBorder,
-                            "noscale" => StageScaleMode::NoScale,
-                            "showall" => StageScaleMode::ShowAll,
-                            _ => return None,
-                        };
-                        Some(scale_mode)
-                    })
-                    .unwrap_or_default(),
-                config.force_scale,
-            )
-            .with_frame_rate(config.frame_rate)
-            // FIXME - should this be configurable?
-            .with_sandbox_type(SandboxType::Remote)
-            .with_page_url(window.location().href().ok())
-            .build();
-
         let mut callstack = None;
-        if let Ok(mut core) = core.try_lock() {
-            // Set config parameters.
-            core.set_background_color(config.background_color);
-            core.set_show_menu(config.show_menu);
-            core.set_allow_fullscreen(config.allow_fullscreen);
-            core.set_window_mode(config.wmode.as_deref().unwrap_or("window"));
+        if let Ok(core) = player.core.try_lock() {
             callstack = Some(core.callstack());
         }
 
         // Create instance.
         let instance = RuffleInstance {
-            core,
+            core: player.core,
             callstack,
             js_player: js_player.clone(),
-            canvas: canvas.clone(),
+            canvas: player.canvas.clone(),
             canvas_width: 0, // Initialize canvas width and height to 0 to force an initial canvas resize.
             canvas_height: 0,
             device_pixel_ratio: window.device_pixel_ratio(),
@@ -829,12 +423,13 @@ impl RuffleHandle {
             unload_callback: None,
             timestamp: None,
             has_focus: false,
-            trace_observer,
+            trace_observer: player.trace_observer,
             log_subscriber,
         };
 
         // Prevent touch-scrolling on canvas.
-        canvas
+        player
+            .canvas
             .style()
             .set_property("touch-action", "none")
             .warn_on_error();
@@ -850,7 +445,7 @@ impl RuffleHandle {
 
             // Create mouse move handler.
             instance.mouse_move_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "pointermove",
                 false,
                 move |js_event: PointerEvent| {
@@ -871,7 +466,7 @@ impl RuffleHandle {
 
             // Create mouse enter handler.
             instance.mouse_enter_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "pointerenter",
                 false,
                 move |_js_event: PointerEvent| {
@@ -885,7 +480,7 @@ impl RuffleHandle {
 
             // Create mouse leave handler.
             instance.mouse_leave_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "pointerleave",
                 false,
                 move |_js_event: PointerEvent| {
@@ -900,7 +495,7 @@ impl RuffleHandle {
 
             // Create mouse down handler.
             instance.mouse_down_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "pointerdown",
                 false,
                 move |js_event: PointerEvent| {
@@ -961,7 +556,7 @@ impl RuffleHandle {
 
             // Create mouse up handler.
             instance.mouse_up_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "pointerup",
                 false,
                 move |js_event: PointerEvent| {
@@ -994,7 +589,7 @@ impl RuffleHandle {
 
             // Create mouse wheel handler.
             instance.mouse_wheel_callback = Some(JsCallback::register(
-                &canvas,
+                &player.canvas,
                 "wheel",
                 false,
                 move |js_event: WheelEvent| {
@@ -1418,175 +1013,6 @@ pub enum RuffleInstanceError {
     InstanceNotFound,
 }
 
-#[wasm_bindgen(raw_module = "./ruffle-imports")]
-extern "C" {
-    #[wasm_bindgen(catch, js_name = "getProperty")]
-    pub fn get_property(target: &JsValue, key: &JsValue) -> Result<JsValue, JsValue>;
-}
-
-async fn create_renderer(
-    builder: PlayerBuilder,
-    document: &web_sys::Document,
-    config: &Config,
-) -> Result<(PlayerBuilder, HtmlCanvasElement), Box<dyn Error>> {
-    #[cfg(not(any(
-        feature = "canvas",
-        feature = "webgl",
-        feature = "webgpu",
-        feature = "wgpu-webgl"
-    )))]
-    std::compile_error!("You must enable one of the render backend features (e.g., webgl).");
-
-    let _is_transparent = config.wmode.as_deref() == Some("transparent");
-
-    let mut renderer_list = vec!["wgpu-webgl", "webgpu", "webgl", "canvas"];
-    if let Some(preferred_renderer) = &config.preferred_renderer {
-        if let Some(pos) = renderer_list.iter().position(|&r| r == preferred_renderer) {
-            renderer_list.remove(pos);
-            renderer_list.insert(0, preferred_renderer.as_str());
-        } else {
-            tracing::error!("Unrecognized renderer name: {}", preferred_renderer);
-        }
-    }
-
-    // Try to create a backend, falling through to the next backend on failure.
-    // We must recreate the canvas each attempt, as only a single context may be created per canvas
-    // with `getContext`.
-    for renderer in renderer_list {
-        match renderer {
-            #[cfg(all(feature = "webgpu", target_family = "wasm"))]
-            "webgpu" => {
-                // Check that we have access to WebGPU (navigator.gpu should exist).
-                if web_sys::window()
-                    .ok_or(JsValue::FALSE)
-                    .and_then(|window| {
-                        js_sys::Reflect::has(&window.navigator(), &JsValue::from_str("gpu"))
-                    })
-                    .unwrap_or_default()
-                {
-                    tracing::info!("Creating wgpu webgpu renderer...");
-                    let canvas: HtmlCanvasElement = document
-                        .create_element("canvas")
-                        .into_js_result()?
-                        .dyn_into()
-                        .map_err(|_| "Expected HtmlCanvasElement")?;
-
-                    match ruffle_render_wgpu::backend::WgpuRenderBackend::for_canvas(
-                        canvas.clone(),
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(renderer) => {
-                            return Ok((builder.with_renderer(renderer), canvas));
-                        }
-                        Err(error) => {
-                            tracing::error!("Error creating wgpu webgpu renderer: {}", error)
-                        }
-                    }
-                }
-            }
-            #[cfg(all(feature = "wgpu-webgl", target_family = "wasm"))]
-            "wgpu-webgl" => {
-                tracing::info!("Creating wgpu webgl renderer...");
-                let canvas: HtmlCanvasElement = document
-                    .create_element("canvas")
-                    .into_js_result()?
-                    .dyn_into()
-                    .map_err(|_| "Expected HtmlCanvasElement")?;
-
-                match ruffle_render_wgpu::backend::WgpuRenderBackend::for_canvas(
-                    canvas.clone(),
-                    false,
-                )
-                .await
-                {
-                    Ok(renderer) => {
-                        return Ok((builder.with_renderer(renderer), canvas));
-                    }
-                    Err(error) => {
-                        tracing::error!("Error creating wgpu webgl renderer: {}", error)
-                    }
-                }
-            }
-            #[cfg(feature = "webgl")]
-            "webgl" => {
-                tracing::info!("Creating WebGL renderer...");
-                let canvas: HtmlCanvasElement = document
-                    .create_element("canvas")
-                    .into_js_result()?
-                    .dyn_into()
-                    .map_err(|_| "Expected HtmlCanvasElement")?;
-                match ruffle_render_webgl::WebGlRenderBackend::new(&canvas, _is_transparent) {
-                    Ok(renderer) => {
-                        return Ok((builder.with_renderer(renderer), canvas));
-                    }
-                    Err(error) => tracing::error!("Error creating WebGL renderer: {}", error),
-                }
-            }
-            #[cfg(feature = "canvas")]
-            "canvas" => {
-                tracing::info!("Creating Canvas renderer...");
-                let canvas: HtmlCanvasElement = document
-                    .create_element("canvas")
-                    .into_js_result()?
-                    .dyn_into()
-                    .map_err(|_| "Expected HtmlCanvasElement")?;
-                match ruffle_render_canvas::WebCanvasRenderBackend::new(&canvas, _is_transparent) {
-                    Ok(renderer) => {
-                        return Ok((builder.with_renderer(renderer), canvas));
-                    }
-                    Err(error) => tracing::error!("Error creating canvas renderer: {}", error),
-                }
-            }
-            _ => {}
-        }
-    }
-    Err("Unable to create renderer".into())
-}
-
-fn set_panic_hook() {
-    static HOOK_HAS_BEEN_SET: Once = Once::new();
-    HOOK_HAS_BEEN_SET.call_once(|| {
-        std::panic::set_hook(Box::new(|info| {
-            RUFFLE_GLOBAL_PANIC.call_once(|| {
-                console_error_panic_hook::hook(info);
-
-                let _ = INSTANCES.try_with(|instances| {
-                    let mut players = Vec::new();
-
-                    // We have to be super cautious to not panic here, and not hold any borrows for
-                    // longer than we need to.
-                    // We grab all of the JsPlayers out from the list and release our hold, as they
-                    // may call back to destroy() - which will mutably borrow instances.
-
-                    if let Ok(instances) = instances.try_borrow() {
-                        for (_, instance) in instances.iter() {
-                            if let Ok((player, Some(callstack))) = instance
-                                .try_borrow()
-                                .map(|i| (i.js_player.clone(), i.callstack.clone()))
-                            {
-                                players.push((player, callstack));
-                            }
-                        }
-                    }
-                    for (player, callstack) in players {
-                        let error = JsError::new(&info.to_string());
-                        callstack.avm2(|callstack| {
-                            let _ = js_sys::Reflect::set(
-                                &error,
-                                &"avmStack".into(),
-                                &callstack.to_string().into(),
-                            );
-                        });
-                        player.panic(&error);
-                    }
-                });
-            });
-        }));
-    });
-}
-
 fn parse_movie_parameters(input: &JsValue) -> Vec<(String, String)> {
     let mut params = Vec::new();
     if let Ok(keys) = js_sys::Reflect::own_keys(input) {
@@ -1599,4 +1025,64 @@ fn parse_movie_parameters(input: &JsValue) -> Vec<(String, String)> {
         }
     }
     params
+}
+
+#[wasm_bindgen(start)]
+fn global_init() {
+    // Redirect Log to Tracing
+    let _ = tracing_log::LogTracer::builder()
+        // wgpu crates are extremely verbose
+        .ignore_crate("wgpu_hal")
+        .ignore_crate("wgpu_core")
+        .init();
+
+    // This is the default, global log subscriber.
+    // It should only catch things that aren't attached to a specific Ruffle instance,
+    // as they have their own configurable loggers.
+    let _ = tracing::subscriber::set_global_default(
+        Registry::default().with(WASMLayer::new(
+            WASMLayerConfigBuilder::new()
+                .set_max_level(tracing::Level::INFO)
+                .build(),
+        )),
+    );
+
+    std::panic::set_hook(Box::new(|info| {
+        RUFFLE_GLOBAL_PANIC.call_once(|| {
+            console_error_panic_hook::hook(info);
+
+            let _ = INSTANCES.try_with(|instances| {
+                let mut players = Vec::new();
+
+                // We have to be super cautious to not panic here, and not hold any borrows for
+                // longer than we need to.
+                // We grab all of the JsPlayers out from the list and release our hold, as they
+                // may call back to destroy() - which will mutably borrow instances.
+
+                if let Ok(instances) = instances.try_borrow() {
+                    for (_, instance) in instances.iter() {
+                        if let Ok((player, Some(callstack))) = instance
+                            .try_borrow()
+                            .map(|i| (i.js_player.clone(), i.callstack.clone()))
+                        {
+                            players.push((player, callstack));
+                        }
+                    }
+                }
+                for (player, callstack) in players {
+                    let error = JsError::new(&info.to_string());
+                    callstack.avm2(|callstack| {
+                        let _ = js_sys::Reflect::set(
+                            &error,
+                            &"avmStack".into(),
+                            &callstack.to_string().into(),
+                        );
+                    });
+                    player.panic(&error);
+                }
+            });
+        });
+    }));
+
+    tracing::info!("Ruffle WASM module has been initialized");
 }

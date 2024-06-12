@@ -21,6 +21,13 @@
 import * as utils from "./utils";
 import { isMessage } from "./messages";
 
+declare global {
+    interface Navigator {
+        // Only supported in Firefox, see https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Sharing_objects_with_page_scripts#accessing_page_script_objects_from_content_scripts
+        wrappedJSObject?: Navigator;
+    }
+}
+
 const pendingMessages: ({
     resolve(value: unknown): void;
     reject(reason?: unknown): void;
@@ -151,10 +158,12 @@ function isXMLDocument(): boolean {
     // NOTE: The script code injected here is the compiled form of
     // plugin-polyfill.ts. It is injected by tools/inject_plugin_polyfill.js
     // which just search-and-replaces for this particular string.
-    const permissions = (chrome || browser).runtime.getManifest().permissions;
-    if (!permissions?.includes("scripting")) {
-        // Chrome does this differently, by injecting it straight into the main world.
-        // This isn't as fast, oh well.
+    // On browsers which support ExecutionWorld MAIN this will be done earlier.
+    if (
+        navigator.wrappedJSObject &&
+        navigator.wrappedJSObject.plugins.namedItem("Shockwave Flash")
+            ?.filename !== "ruffle.js"
+    ) {
         injectScriptRaw("%PLUGIN_POLYFILL_SOURCE%");
     }
 

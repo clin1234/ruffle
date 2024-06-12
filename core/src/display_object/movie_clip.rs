@@ -2985,14 +2985,6 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
         RefMut::map(self.0.write(gc_context), |this| &mut this.container)
     }
 
-    /// The property `MovieClip.tabChildren` allows changing the behavior of
-    /// tab ordering hierarchically.
-    /// When set to `false`, it excludes the whole subtree represented by
-    /// the movie clip from tab ordering.
-    ///
-    /// _NOTE:_
-    /// According to the AS2 documentation, it should affect only automatic tab ordering.
-    /// However, that does not seem to be the case, as it also affects custom ordering.
     fn is_tab_children_avm1(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
         self.get_avm1_boolean_property(context, "tabChildren", |_| true)
     }
@@ -3358,15 +3350,27 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
     }
 
     fn is_focusable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
-        if !self.movie().is_action_script_3() {
-            if self.is_button_mode(context) {
-                true
-            } else {
-                self.get_avm1_boolean_property(context, "focusEnabled", |_| false)
-            }
-        } else {
+        if self.is_root() {
             false
+        } else if self.is_button_mode(context) {
+            true
+        } else {
+            self.get_avm1_boolean_property(context, "focusEnabled", |_| false)
         }
+    }
+
+    fn is_highlightable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        // Root movie clips are not highlightable.
+        // This applies only to AVM2, as in AVM1 they are also not focusable.
+        !self.is_root() && self.is_highlight_enabled(context)
+    }
+
+    fn is_tabbable(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {
+        if self.is_root() {
+            // Root movie clips are never tabbable.
+            return false;
+        }
+        self.tab_enabled(context)
     }
 
     fn tab_enabled_default(&self, context: &mut UpdateContext<'_, 'gc>) -> bool {

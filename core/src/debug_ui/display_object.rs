@@ -801,6 +801,14 @@ impl DisplayObjectWindow {
                 }
                 ui.end_row();
 
+                ui.label("Is Root");
+                if object.is_root() {
+                    ui.label("Yes");
+                } else {
+                    ui.label("No");
+                }
+                ui.end_row();
+
                 if let Some(other) = object.masker() {
                     ui.label("Masker");
                     open_display_object_button(
@@ -886,6 +894,16 @@ impl DisplayObjectWindow {
                         if enabled != obj.raw_container().mouse_children() {
                             obj.raw_container_mut(context.gc_context)
                                 .set_mouse_children(enabled);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Tab children enabled");
+                    ui.horizontal(|ui| {
+                        let mut enabled = obj.is_tab_children(context);
+                        Checkbox::new(&mut enabled, "Enabled").ui(ui);
+                        if enabled != obj.is_tab_children(context) {
+                            obj.set_tab_children(context, enabled);
                         }
                     });
                     ui.end_row();

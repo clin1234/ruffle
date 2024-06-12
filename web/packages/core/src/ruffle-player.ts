@@ -1,5 +1,5 @@
-import type { RuffleHandle } from "../dist/ruffle_web";
-import { loadRuffle } from "./load-ruffle";
+import type { RuffleHandle, ZipWriter } from "../dist/ruffle_web";
+import { createRuffleBuilder } from "./load-ruffle";
 import { applyStaticStyles, ruffleShadowTemplate } from "./shadow-template";
 import { lookupElement } from "./register-element";
 import { DEFAULT_CONFIG } from "./config";
@@ -15,8 +15,8 @@ import type { MovieMetadata } from "./movie-metadata";
 import { swfFileName } from "./swf-utils";
 import { buildInfo } from "./build-info";
 import { text, textAsParagraphs } from "./i18n";
-import JSZip from "jszip";
 import { isExtension } from "./current-script";
+import { configureBuilder } from "./internal/builder";
 
 const RUFFLE_ORIGIN = "https://ruffle.rs";
 const DIMENSION_REGEX = /^\s*(\d+(\.\d+)?(%)?)/;
@@ -166,6 +166,7 @@ export class RufflePlayer extends HTMLElement {
 
     private swfUrl?: URL;
     private instance: RuffleHandle | null;
+    private newZipWriter: (() => ZipWriter) | null;
     private lastActivePlayingState: boolean;
 
     private _metadata: MovieMetadata | null;
@@ -332,6 +333,7 @@ export class RufflePlayer extends HTMLElement {
         );
 
         this.instance = null;
+        this.newZipWriter = null;
         this.onFSCommand = null;
 
         this._readyState = ReadyState.HaveNothing;
@@ -672,9 +674,8 @@ export class RufflePlayer extends HTMLElement {
                 'The configuration option contextMenu no longer takes a boolean. Use "on", "off", or "rightClickOnly".',
             );
         }
-        this.instance = await loadRuffle(
-            this.container,
-            this,
+
+        const [builder, zipWriterClass] = await createRuffleBuilder(
             this.loadedConfig || {},
             this.onRuffleDownloadProgress.bind(this),
         ).catch((e) => {
@@ -715,12 +716,15 @@ export class RufflePlayer extends HTMLElement {
             this.panic(e);
             throw e;
         });
+        this.newZipWriter = zipWriterClass;
+        configureBuilder(builder, this.loadedConfig || {});
+        builder.setVolume(this.volumeSettings.get_volume());
 
         if (this.loadedConfig?.fontSources) {
             for (const url of this.loadedConfig.fontSources) {
                 try {
                     const response = await fetch(url);
-                    this.instance!.add_font(
+                    builder.addFont(
                         url,
                         new Uint8Array(await response.arrayBuffer()),
                     );
@@ -733,26 +737,22 @@ export class RufflePlayer extends HTMLElement {
             }
         }
 
-        if (this.loadedConfig?.defaultFonts?.sans) {
-            this.instance!.set_default_font(
-                "sans",
-                this.loadedConfig?.defaultFonts.sans,
-            );
-        }
-        if (this.loadedConfig?.defaultFonts?.serif) {
-            this.instance!.set_default_font(
-                "serif",
-                this.loadedConfig?.defaultFonts.serif,
-            );
-        }
-        if (this.loadedConfig?.defaultFonts?.typewriter) {
-            this.instance!.set_default_font(
-                "typewriter",
-                this.loadedConfig?.defaultFonts.typewriter,
-            );
+        for (const key in this.loadedConfig?.defaultFonts) {
+            const names = (
+                this.loadedConfig.defaultFonts as {
+                    [key: string]: Array<string>;
+                }
+            )[key];
+            if (names) {
+                builder.setDefaultFont(key, names);
+            }
         }
 
-        this.instance!.set_volume(this.volumeSettings.get_volume());
+        this.instance = await builder.build(this.container, this).catch((e) => {
+            console.error(`Serious error loading Ruffle: ${e}`);
+            this.panic(e);
+            throw e;
+        });
 
         this.rendererDebugInfo = this.instance!.renderer_debug_info();
 
@@ -1162,13 +1162,17 @@ export class RufflePlayer extends HTMLElement {
             event.pointerType === "touch" || event.pointerType === "pen";
     }
 
-    private base64ToBlob(bytesBase64: string, mimeString: string): Blob {
+    private base64ToArray(bytesBase64: string): Uint8Array {
         const byteString = atob(bytesBase64);
-        const ab = new ArrayBuffer(byteString.length);
-        const ia = new Uint8Array(ab);
+        const ia = new Uint8Array(byteString.length);
         for (let i = 0; i < byteString.length; i++) {
             ia[i] = byteString.charCodeAt(i);
         }
+        return ia;
+    }
+
+    private base64ToBlob(bytesBase64: string, mimeString: string): Blob {
+        const ab = this.base64ToArray(bytesBase64);
         const blob = new Blob([ab], { type: mimeString });
         return blob;
     }
@@ -1345,16 +1349,13 @@ export class RufflePlayer extends HTMLElement {
      * Gets the local save information as SOL files and downloads them as a single ZIP file.
      */
     private async backupSaves(): Promise<void> {
-        const zip = new JSZip();
+        const zip = this.newZipWriter!();
         const duplicateNames: string[] = [];
         Object.keys(localStorage).forEach((key) => {
             let solName = String(key.split("/").pop());
             const solData = localStorage.getItem(key);
             if (solData && this.isB64SOL(solData)) {
-                const blob = this.base64ToBlob(
-                    solData,
-                    "application/octet-stream",
-                );
+                const array = this.base64ToArray(solData);
                 const duplicate = duplicateNames.filter(
                     (value) => value === solName,
                 ).length;
@@ -1362,10 +1363,10 @@ export class RufflePlayer extends HTMLElement {
                 if (duplicate > 0) {
                     solName += ` (${duplicate + 1})`;
                 }
-                zip.file(solName + ".sol", blob);
+                zip.addFile(solName + ".sol", array);
             }
         });
-        const blob = await zip.generateAsync({ type: "blob" });
+        const blob = new Blob([zip.save()], { type: "application/zip" });
         this.saveFile(blob, "saves.zip");
     }
 

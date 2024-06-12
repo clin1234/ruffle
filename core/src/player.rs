@@ -602,7 +602,7 @@ impl Player {
                 // no AVM1 or AVM2 object - so just prepare the builtin items
                 let mut menu = ContextMenuState::new();
                 let builtin_items = BuiltInItemFlags::for_stage(context.stage);
-                menu.build_builtin_items(builtin_items, context.stage, &context.ui.language());
+                menu.build_builtin_items(builtin_items, context);
                 menu
             };
 
@@ -674,6 +674,9 @@ impl Player {
                     }
                     ContextMenuCallback::QualityHigh => {
                         context.stage.set_quality(context, StageQuality::High)
+                    }
+                    ContextMenuCallback::TextControl { code, text } => {
+                        text.text_control_input(*code, context)
                     }
                     _ => {}
                 }
@@ -1542,6 +1545,9 @@ impl Player {
                 for (object, event) in events {
                     let display_object = object.as_displayobject();
                     if !display_object.avm1_removed() {
+                        if event == ClipEvent::Press {
+                            Self::update_focus_on_mouse_press(context, display_object);
+                        }
                         object.handle_clip_event(context, event);
                         if display_object.movie().is_action_script_3() {
                             object.event_dispatch_to_avm2(context, event);
@@ -1573,6 +1579,23 @@ impl Player {
         self.mouse_cursor_needs_check = mouse_cursor_needs_check;
 
         needs_render
+    }
+
+    fn update_focus_on_mouse_press(context: &mut UpdateContext, pressed_object: DisplayObject) {
+        let is_avm2 = context.swf.is_action_script_3();
+
+        // Update AVM1 focus
+        if !is_avm2 {
+            let tracker = context.focus_tracker;
+            // In AVM1 text fields are somewhat special when handling focus.
+            // When a text field is clicked, it gains focus,
+            // when something else is clicked, it loses the focus.
+            // However, this logic only applies to text fields, other objects
+            // (buttons, movie clips) neither gain focus nor lose it upon press.
+            if tracker.get_as_edit_text().is_some() && pressed_object.as_edit_text().is_none() {
+                tracker.set(None, context);
+            }
+        }
     }
 
     //Checks if two displayObjects have the same depth and id and accur in the same movie.s
@@ -2289,6 +2312,13 @@ impl PlayerBuilder {
     #[inline]
     pub fn with_audio(mut self, audio: impl 'static + AudioBackend) -> Self {
         self.audio = Some(Box::new(audio));
+        self
+    }
+
+    /// Sets the audio backend of the player.
+    #[inline]
+    pub fn with_boxed_audio(mut self, audio: Box<dyn AudioBackend>) -> Self {
+        self.audio = Some(audio);
         self
     }
 

@@ -619,12 +619,8 @@ impl<'gc> Script<'gc> {
             let scope = ScopeChain::new(domain);
 
             globals.vtable().unwrap().init_vtable(
+                globals.instance_class().unwrap(),
                 globals.instance_of(),
-                globals
-                    .instance_of()
-                    .unwrap()
-                    .inner_class_definition()
-                    .protected_namespace(),
                 &self.traits()?,
                 Some(scope),
                 None,

@@ -275,11 +275,11 @@ fn describe_internal_body<'gc>(
     let super_vtable = if use_instance_traits {
         class_obj.superclass_object().map(|c| c.instance_vtable())
     } else {
-        class_obj.instance_of().map(|c| c.instance_vtable())
+        class_obj.instance_class().map(|c| c.instance_vtable())
     };
 
     if flags.contains(DescribeTypeFlags::INCLUDE_INTERFACES) && use_instance_traits {
-        for interface in class_obj.interfaces() {
+        for interface in &*class_obj.inner_class_definition().all_interfaces() {
             let interface_name = interface
                 .name()
                 .to_qualified_name(activation.context.gc_context);
@@ -383,14 +383,12 @@ fn describe_internal_body<'gc>(
                 let declared_by = method.class;
 
                 if flags.contains(DescribeTypeFlags::HIDE_OBJECT)
-                    && declared_by == Some(activation.avm2().classes().object)
+                    && declared_by == activation.avm2().classes().object.inner_class_definition()
                 {
                     continue;
                 }
 
                 let declared_by_name = declared_by
-                    .unwrap()
-                    .inner_class_definition()
                     .name()
                     .to_qualified_name(activation.context.gc_context);
 
@@ -477,8 +475,6 @@ fn describe_internal_body<'gc>(
                 let accessor_type =
                     method_type.to_qualified_name_or_star(activation.context.gc_context);
                 let declared_by = defining_class
-                    .unwrap()
-                    .inner_class_definition()
                     .name()
                     .to_qualified_name(activation.context.gc_context);
 
